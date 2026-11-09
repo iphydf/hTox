@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE StrictData        #-}
 -- | App state, how events change it, and the commands for Tox. Pure, so we
 -- can test all the UI logic off the device.
 module HTox.Model
@@ -23,6 +24,8 @@ module HTox.Model
   , chatIdError
   , Member (..)
   , GroupEntry (..)
+  , GroupFile (..)
+  , groupFileName
   , Happening (..)
   , Invite (..)
   , groupMuted
@@ -50,13 +53,14 @@ module HTox.Model
   , AccountSettings (..)
   , DeviceSettings (..)
   , preview
-  , quoted
+  , replied
   , forwardable
   , copiedText
   , callText
   , duration
   , interrupted
   , linkError
+  , pairingLink
   , Delivery (..)
   , Profile (..)
   , ProfileId (..)
@@ -73,6 +77,7 @@ module HTox.Model
   , PhoneCall (..)
   , ringTimeout
   , Screen (..)
+  , openChat
   , Client (..)
   , Model (..)
   , Event (..)
@@ -117,34 +122,51 @@ import           Text.Read            (readMaybe)
 import qualified Tox.Application.Tox  as Tox
 import           Tox.Client
 import qualified Tox.Client.Debug     as Debug
+import qualified Tox.Client.Home      as Home
 import qualified Tox.Client.Linked    as Linked
 import           Tox.Client.Locations (location)
 import           Tox.Client.Relays    (relayed, relayedNames)
 import           Tox.Client.Types
 import qualified Tox.Client.Update    as Client
 import           Tox.Client.Update    (Command (..), forwardable, interrupted,
-                                       memberByKey, quoted)
+                                       memberByKey, replied)
 import qualified Tox.Sync.Pairing     as Pairing
 
 -- | Text for the chat list and notifications. Actions get the name in front.
 preview :: Text -> Message -> Text
 preview name m = case (messageCall m, messageFile m) of
   (Just record, _) -> callText (messageMine m) record
-  (_, Just _)      -> "\x1F4CE " <> messageText m
-  _ | messageKind m == Tox.MessageAction -> "* " <> name <> " " <> messageText m
-    | Just _ <- location (messageText m) -> "\x1F4CD Location"
-    | otherwise -> messageText m
+  (_, Just _)      -> "\x1F4CE " <> text
+  _ | messageKind m == Tox.MessageAction -> "* " <> name <> " " <> text
+    | Just _ <- location text -> "\x1F4CD Location"
+    | otherwise -> text
+  where text = shownText (messageText m)
 
-copiedText :: Client -> ContactId -> [MessageId] -> Text
-copiedText client cid is = case [m | m <- messages, messageId m `elem` is, isNothing (messageCall m)] of
-  [m] -> messageText m
-  ms  -> Text.intercalate "\n" [whose m <> ": " <> messageText m | m <- ms]
+copiedText :: Client -> Client.Chat -> [MessageId] -> Text
+copiedText client chat is = case said of
+  [(_, text)] -> text
+  _           -> Text.intercalate "\n" [whose <> ": " <> text | (whose, text) <- said]
   where
-    contact = Map.lookup cid (clientContacts client)
-    messages = maybe [] contactMessages contact
-    whose m
-      | messageMine m = profileNickname (clientProfile client)
-      | otherwise = maybe "" (contactLabel cid) contact
+    said = case chat of
+      Client.FriendChat cid ->
+        let contact = Map.lookup cid (clientContacts client)
+            whose m
+              | messageMine m = profileNickname (clientProfile client)
+              | otherwise = maybe "" (contactLabel cid) contact
+        in [ (whose m, shownText (messageText m))
+           | m <- maybe [] contactMessages contact, messageId m `elem` is, isNothing (messageCall m) ]
+      Client.GroupChat gid -> case Map.lookup gid (clientGroups client) of
+        Nothing -> []
+        Just g ->
+          let ours = groupNick (clientProfile client)
+              -- Relayed ones by the name relayed.
+              whoSaid e = case entryWhat e of
+                Said (Just m) _ body _ _ -> Just (uttered (clientProfile client) g m (shownText body))
+                Said Nothing _ body _ _  -> Just (ours, shownText body)
+                PrivateFrom m _ body     -> Just (memberLabel m, shownText body)
+                PrivateTo _ _ body _     -> Just (ours, shownText body)
+                _                        -> Nothing
+          in [ said' | e <- groupEntries g, entryId e `elem` is, Just said' <- [whoSaid e] ]
 
 callText :: Bool -> CallRecord -> Text
 callText mine record =
@@ -170,12 +192,6 @@ contactOrder = sortOn latest . Map.toList . clientContacts
     latest (cid, c) =
       (Down (messageTime <$> listToMaybe (reverse (contactMessages c))), Text.toCaseFold (contactLabel cid c))
 
-memberLabel :: Member -> Text
-memberLabel m
-  | not (Text.null (memberName m)) = memberName m
-  | not (Text.null (memberKey m)) = Text.take 8 (memberKey m)
-  | otherwise = "Someone"
-
 -- | Sender and text to show. Messages of the relay bot show as "Name via
 -- Bot".
 uttered :: Profile -> Group -> Member -> Text -> (Text, Text)
@@ -190,19 +206,19 @@ uttered profile g = utter
 -- relayed name ends.
 speakers :: Profile -> Group -> [Text]
 speakers profile g = Set.toList $ Set.fromList $ groupNick profile
-  : [memberLabel m | GroupEntry _ (Said (Just m) _ _ _) _ <- groupEntries g, Just (memberKey m) /= groupRelayBot g]
+  : [memberLabel m | GroupEntry _ (Said (Just m) _ _ _ _) _ <- groupEntries g, Just (memberKey m) /= groupRelayBot g]
 
 -- | Members who said anything, with how many of their messages look relayed
 -- and how many there are. Likeliest bot first.
 relayCounts :: Group -> [(Member, Int, Int)]
 relayCounts g = sortOn (\(m, r, n) -> (Down r, Down n, memberLabel m)) $ Map.elems $ Map.fromListWith add
-  [ (memberKey m, (m, fromEnum (isJust (relayed [] text)), 1)) | GroupEntry _ (Said (Just m) _ text _) _ <- groupEntries g ]
+  [ (memberKey m, (m, fromEnum (isJust (relayed [] (shownText text))), 1)) | GroupEntry _ (Said (Just m) _ text _ _) _ <- groupEntries g ]
   where add (m, r, n) (_, r', n') = (m, r + r', n + n')
 
 -- | Names the relay bot relayed, with the last time, latest first.
 relayedThrough :: Profile -> Group -> [(Text, UTCTime)]
 relayedThrough profile g = relayedNames (speakers profile g)
-  [ (time, text) | GroupEntry time (Said (Just m) _ text _) _ <- groupEntries g, Just (memberKey m) == groupRelayBot g ]
+  [ (time, shownText text) | GroupEntry time (Said (Just m) _ text _ _) _ <- groupEntries g, Just (memberKey m) == groupRelayBot g ]
 
 foundingError :: Founding -> Text -> Maybe Text
 foundingError founding name
@@ -266,7 +282,7 @@ awayName = \case
 connectionText :: Connection -> Text
 connectionText = \case
   Offline -> "Connecting\x2026"
-  ViaTcp  -> "Online through a relay"
+  ViaTcp  -> "Online via TCP relay"
   ViaUdp  -> "Online"
 
 -- | What the other profiles show of one, as in their drawer.
@@ -310,8 +326,8 @@ data Screen
   = Contacts
   | Chat ContactId
   | Details ContactId
-  | Forward ContactId [MessageId]
-  | MessageInfo ContactId MessageId
+  | Forward Client.Chat [MessageId]
+  | MessageInfo Client.Chat MessageId
   | CallsScreen
   | ProfileScreen
   | SettingsScreen
@@ -329,6 +345,10 @@ data Screen
   | InviteFriendsScreen GroupId
   | GroupSettingsScreen GroupId
   | LinkScreen
+  | UnlockScreen
+    -- ^ The password of a .tox file being imported.
+  | DevicesScreen
+    -- ^ The account's devices linked here, and pairing a new one.
     -- ^ Linking to an account on another device, by its pairing link.
   | BackupScreen
   | DebugScreen
@@ -342,7 +362,7 @@ data Model = Model
     -- ^ Whether the app is in front of the user.
   , modelDrawer        :: Bool
   , modelPassword      :: Text
-    -- ^ Of the invite open, or the public group to join.
+    -- ^ Of the open invite, or the public group to join.
   , modelTopic         :: Text
     -- ^ As edited until applied.
   , modelFounding      :: Founding
@@ -394,7 +414,7 @@ data Event
   | Open Screen
   | Back
   | OpenDrawer
-  | DraftChanged Text
+  | DraftChanged Text UTCTime
   | Send UTCTime
   | NicknameChanged Text
   | StatusChanged Text
@@ -418,7 +438,7 @@ data Event
   | ProxyHostChanged Text
   | ProxyPortChanged Text
   | ApplyProxy
-  | Attach FilePath Text Word64 BS.ByteString
+  | Attach UTCTime FilePath Text Word64 BS.ByteString
     -- ^ Picked for the open chat: path of our copy, name, size and a new
     -- file ID.
   | ShareLocation Double Double
@@ -560,11 +580,15 @@ update event model = measuring . leaving $ case event of
   LinkEdited link -> only model { modelLink = link, modelNotice = Nothing }
   ToggleBackup pid -> only model
     { modelBackup = (if Set.member pid (modelBackup model) then Set.delete else Set.insert) pid (modelBackup model) }
-  Back -> only $ fromMaybe model (back model { modelNotice = Nothing })
+  Back -> reading $ fromMaybe model (back model { modelNotice = Nothing })
   Notify notice -> only model { modelNotice = Just notice }
   ShareLocation latitude longitude -> staging (StagedPlace latitude longitude) model { modelNotice = Nothing }
   OpenDrawer -> only model { modelDrawer = True }
-  DraftChanged draft -> maybe (only model) (\chat -> told (Client.SetDraft chat draft) model) (openChat model)
+  DraftChanged draft time -> case openChat model of
+    Just chat@(Client.FriendChat cid) | not (Text.null (Text.strip draft)) ->
+      let (drafted, commands) = told (Client.SetDraft chat draft) model
+      in (commands <>) <$> told (Client.Typing cid time) drafted
+    chat -> maybe (only model) (\c -> told (Client.SetDraft c draft) model) chat
   Send time -> case openChat model of
     Just chat@(Client.GroupChat gid)
       | Just key <- modelPrivateTo model ->
@@ -596,18 +620,21 @@ update event model = measuring . leaving $ case event of
     | away -> only model { modelAway = True }
     | otherwise -> reading model { modelAway = False, modelUnseen = 0 }
   JumpToEnd -> only model { modelJump = modelJump model + 1, modelUnseen = 0 }
-  Reply i -> case modelScreen model of
-    Chat cid -> told (Client.ReplyTo cid i) model { modelSelected = Set.empty }
-    _        -> only model
-  CancelReply -> case modelScreen model of
-    Chat cid -> told (Client.CancelReply cid) model
-    _        -> only model
+  Reply i -> case openChat model of
+    Just chat -> told (Client.ReplyTo chat i) model { modelSelected = Set.empty }
+    Nothing   -> only model
+  CancelReply -> case openChat model of
+    Just chat -> told (Client.CancelReply chat) model
+    Nothing   -> only model
   ForwardTo target time -> case modelScreen model of
     Forward source is | Map.member target (clientContacts client) ->
       told (Client.Forward source is target time) model { modelScreen = Chat target, modelSelected = Set.empty }
     _ -> only model
-  Attach path name size fileId -> case modelScreen model of
+  Attach time path name size fileId -> case modelScreen model of
     Chat _ -> staging (StagedFile path name size fileId) model
+    -- Shared at once: a group has nothing to stage it in.
+    GroupChat gid -> let (m, commands) = told (Client.WroteGroupFile gid time path name size) model
+                     in (m { modelJump = modelJump m + 1, modelUnseen = 0 }, commands)
     -- The user left the chat while picking, so drop the copy.
     _      -> (model, [ForgetFile path])
   StartCall time camera -> case modelScreen model of
@@ -716,7 +743,8 @@ followed event old new = case event of
   Client.Measured report -> new { modelDebug = Just report }
   Client.AddFailed address reason -> new { modelScreen = AddContact, modelAddress = address, modelAddError = Just (notAdded reason) }
   Client.Received cid _ _ _ -> unseen (Chat cid)
-  Client.GroupReceived gid _ _ _ _ -> unseen (GroupChat gid)
+  Client.GroupReceived gid _ _ _ _ _ -> unseen (GroupChat gid)
+  Client.GroupFileShared gid _ _ _ _ -> unseen (GroupChat gid)
   Client.PrivateReceived gid _ _ _ _ -> unseen (GroupChat gid)
   Client.CallElsewhere _
     | Just c <- clientCall (modelClient old), callPhase c /= Ringing -> new { modelNotice = Just "Another profile has a call" }
@@ -762,6 +790,11 @@ openChat model = case modelScreen model of
   GroupChat gid -> Just (Client.GroupChat gid)
   _             -> Nothing
 
+chatScreen :: Client.Chat -> Screen
+chatScreen = \case
+  Client.FriendChat cid -> Chat cid
+  Client.GroupChat gid  -> GroupChat gid
+
 linkError :: Text -> Maybe Text
 linkError link
   | Text.null (Text.strip link) = Just "Paste the link the other device shows"
@@ -775,6 +808,11 @@ privateGone = "They have left the group, so nothing was sent"
 privateMember :: Model -> Group -> Maybe (Tox.PeerId, Member)
 privateMember model g = (`memberByKey` g) =<< modelPrivateTo model
 
+-- | The link a new device pairs with, while its code works.
+pairingLink :: Model -> Maybe Text
+pairingLink model = (\code -> "tox:" <> profileToxId (clientProfile (modelClient model)) <> "?pair=" <> code)
+  <$> (Home.homePairing =<< clientHome (modelClient model))
+
 opened :: Screen -> Model -> Model
 opened screen model = case screen of
   InviteScreen _ _ -> model { modelPassword = "" }
@@ -786,6 +824,7 @@ opened screen model = case screen of
     Nothing -> model
   JoinGroupScreen -> model { modelChatId = "", modelPassword = "" }
   LinkScreen -> model { modelLink = "" }
+  UnlockScreen -> model { modelPassword = "" }
   BackupScreen -> model { modelBackup = Set.fromList (map accountId (modelProfiles model)) }
   DebugScreen -> model { modelDebug = Nothing }
   ProfileScreen -> model
@@ -821,6 +860,7 @@ clientHolds client =
   , ("staged", sum (map length (Map.elems (clientStaged client))))
   ]
   ++ maybe [] Linked.linkedHolds (clientLinked client)
+  ++ maybe [] Home.homeHolds (clientHome client)
 
 -- | Nothing on the contacts screen (Back leaves the app).
 back :: Model -> Maybe Model
@@ -837,10 +877,12 @@ back model
   | TopicScreen gid <- modelScreen model = Just model { modelScreen = GroupDetails gid }
   | InviteFriendsScreen gid <- modelScreen model = Just model { modelScreen = GroupDetails gid }
   | GroupSettingsScreen gid <- modelScreen model = Just model { modelScreen = GroupDetails gid }
-  | Forward cid _ <- modelScreen model = Just model { modelScreen = Chat cid }
-  | MessageInfo cid _ <- modelScreen model = Just model { modelScreen = Chat cid }
+  | Forward chat _ <- modelScreen model = Just model { modelScreen = chatScreen chat }
+  | MessageInfo chat _ <- modelScreen model = Just model { modelScreen = chatScreen chat }
   | modelScreen model == ProxyScreen = Just model { modelScreen = SettingsScreen }
   | modelScreen model == LinkScreen = Just model { modelScreen = ProfilesScreen }
+  | modelScreen model == UnlockScreen = Just model { modelScreen = ProfilesScreen }
+  | modelScreen model == DevicesScreen = Just model { modelScreen = ProfileScreen }
   | modelScreen model == BackupScreen = Just model { modelScreen = ProfilesScreen }
   | otherwise = Just model { modelScreen = Contacts }
 
@@ -866,8 +908,8 @@ groupNotifications now client = Map.mapMaybe unread (clientGroups client)
       | groupUnread g > 0 && (not (groupMuted now g) || groupMentions g) =
           let said = uttered (clientProfile client) g
               received = \case
-                GroupEntry _ (Said (Just who) kind text _) _ -> [(said who text, False, kind)]
-                GroupEntry _ (PrivateFrom who kind text) _   -> [((memberLabel who, text), True, kind)]
+                GroupEntry _ (Said (Just who) kind text _ _) _ -> [(said who (shownText text), False, kind)]
+                GroupEntry _ (PrivateFrom who kind text) _   -> [((memberLabel who, shownText text), True, kind)]
                 _                                          -> []
               theirs = concatMap received (groupEntries g)
               -- Private messages count as mentions.
@@ -879,8 +921,8 @@ groupNotifications now client = Map.mapMaybe unread (clientGroups client)
       | otherwise = name <> ": " <> text
       where name = who <> (if private then " (privately)" else "")
 
--- | Unread missed calls per contact (notified apart from messages). Not for
--- muted contacts.
+-- | Unread missed calls per contact (notified separately from messages).
+-- Not for muted contacts.
 missedCalls :: UTCTime -> Client -> Map ContactId Int
 missedCalls now = Map.mapMaybe (positive . length . filter (isJust . messageCall)) . unreadOf now
   where positive n = if n > 0 then Just n else Nothing

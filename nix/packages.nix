@@ -47,5 +47,8 @@ in
       ffmpeg = pkgs.ffmpeg;
       opus = pkgs.libopus;
     } "toxav" ../../hs-toxav;
+  # hs-toxav on Android links Android's MediaCodec library, which its NDK
+  # brings.
+  mediandk = null;
   qrcode-core = doJailbreak (markUnbroken super.qrcode-core);
 }

@@ -12,6 +12,7 @@ import           Test.Hspec
 
 import qualified Tox.Application.Tox as Tox
 import qualified Tox.Client.Update   as Client
+import qualified Tox.Share.Info      as Info
 
 import           HTox.Model
 import           HTox.Sample
@@ -32,6 +33,8 @@ env = Env
   , envClock24 = False
   , envElsewhere = Nothing
   , envOthers = []
+  , envSchema = 3
+  , envGraphics = ""
   }
 
 shown :: Model -> Widget
@@ -78,33 +81,81 @@ tapOn caption widget =
 tappedIn :: Widget -> [T.Tapped]
 tappedIn = mapMaybe (tapped . snd) . taps
 
+-- | What each long press does, in order.
+heldIn :: Widget -> [T.Tapped]
+heldIn widget = case widget of
+  LongPressable action child -> maybe id (:) (tapped action) (heldIn child)
+  _                          -> concatMap heldIn (children widget)
+
 spec :: Spec
 spec = do
   it "lists invites and groups, and a group's messages under their senders' names" $ do
     let dana = Member (Text.replicate 8 "DA7A0000") "Dana"
         joined = [ ClientEvent (Client.Invited alice team NgcGroup "Team" "invite"), AnswerInvite alice team True
                  , ClientEvent (Client.MemberJoined team (at 3 9 0) 1 dana), ClientEvent (Client.GroupConnected team (at 3 9 0))
-                 , ClientEvent (Client.GroupReceived team (at 3 9 1) 1 Tox.MessageNormal "hi")
-                 , ClientEvent (Client.GroupReceived team (at 3 9 2) 1 Tox.MessageNormal "again") ]
+                 , ClientEvent (Client.GroupReceived team (at 3 9 1) 1 Tox.MessageNormal "hi" Nothing)
+                 , ClientEvent (Client.GroupReceived team (at 3 9 2) 1 Tox.MessageNormal "again" Nothing) ]
         listed = shown (model' (joined ++ [Back, ClientEvent (Client.Invited bob (GroupId "C0DE") NgcGroup "Other" "other invite")]))
     tapOn "Other" listed `shouldBe` Just (T.OpenInvite bob (GroupId "C0DE"))
     tapOn "Team" listed `shouldBe` Just (T.OpenGroup team)
+    heldIn listed `shouldContain` [T.HoldGroup team]
     texts listed `shouldContain` ["Bob invited you to a group"]
     let chatTexts = texts (shown (model' joined))
     filter (`elem` ["Dana", "hi", "again", "2 members"]) chatTexts `shouldBe` ["2 members", "Dana", "hi", "again"]
+    let topical allowed = shown (model' (joined ++ map ClientEvent
+          [Client.TopicChanged team (at 3 9 3) (Just 1) "Haskell", Client.TopicAllowed team allowed] ++ [Open (GroupDetails team)]))
+    texts (topical False) `shouldContain` ["Haskell"]
+    texts (topical False) `shouldNotContain` ["Change topic"]
+    tapOn "Change topic" (topical True) `shouldBe` Just (T.EditTopic team)
     let away = joined ++ [ClientEvent (Client.MemberStatus team 1 Tox.Away), Open (GroupDetails team)]
     texts (shown (model' away)) `shouldContain` ["Dana", "Away"]
     texts (shown (model' (away ++ [ClientEvent (Client.MemberStatus team 1 Tox.Online)]))) `shouldNotContain` ["Away"]
 
+  it "selects, answers and tells of what members wrote in a group, not of who went" $ do
+    let dana = Member (Text.replicate 8 "DA7A0000") "Dana"
+        said = [ ClientEvent (Client.Invited alice team NgcGroup "Team" "invite"), AnswerInvite alice team True
+               , ClientEvent (Client.MemberJoined team (at 3 9 0) 1 dana), ClientEvent (Client.GroupConnected team (at 3 9 0))
+               , ClientEvent (Client.GroupReceived team (at 3 9 1) 1 Tox.MessageNormal "hi" Nothing)
+               , ClientEvent (Client.MemberLeft team (at 3 9 2) 1 Tox.ExitQuit) ]
+        hi = entryAt team 0 (model' said)
+    tapOn "hi" (shown (model' said)) `shouldBe` Just (T.TapEntry team hi)
+    tapOn "Dana left" (shown (model' said)) `shouldBe` Nothing
+    texts (shown (model' (said ++ [Select hi]))) `shouldContain` ["1 selected"]
+    texts (shown (model' (said ++ [Reply hi]))) `shouldContain` ["> hi"]
+    texts (shown (model' (said ++ [Open (MessageInfo (Client.GroupChat team) hi)])))
+      `shouldContain` ["Received", "Nov 3, 2026 9:01 AM", "From", "Dana\n" <> memberKey dana]
+
+  it "shows members coming and going in a row as one line, and one or two as they are" $ do
+    let member n = Member (Text.replicate 8 (Text.pack (show n) <> "0000000")) (Text.pack ["ABCDE" !! fromIntegral n])
+        joined = [ ClientEvent (Client.Invited alice team NgcGroup "Team" "invite"), AnswerInvite alice team True
+                 , ClientEvent (Client.GroupConnected team (at 3 9 0)) ]
+        coming n m = ClientEvent (Client.MemberJoined team (at 3 10 m) n (member n))
+        going n m = ClientEvent (Client.MemberLeft team (at 3 10 m) n Tox.ExitQuit)
+        busy = joined ++ [coming 0 0, coming 1 1, coming 2 2, coming 3 3, going 0 4, coming 0 5, coming 4 6]
+    filter (Text.isInfixOf "joined") (texts (shown (model' busy))) `shouldBe` ["A, B and 3 others joined \x00B7 A left"]
+    filter (Text.isInfixOf "joined") (texts (shown (model' (joined ++ [coming 0 0, coming 1 1])))) `shouldBe` ["A joined", "B joined"]
+
+  it "shows a file shared in a group, downloading it only when tapped" $ do
+    let dana = Member (Text.replicate 8 "DA7A0000") "Dana"
+        inf = Info.Info "notes.txt" 2048 2048 (BS.replicate 20 1)
+        fid = Info.hash inf
+        shared = [ ClientEvent (Client.Invited alice team NgcGroup "Team" "invite"), AnswerInvite alice team True
+                 , ClientEvent (Client.MemberJoined team (at 3 9 0) 1 dana), ClientEvent (Client.GroupConnected team (at 3 9 0))
+                 , ClientEvent (Client.GroupFileShared team (at 3 9 1) 1 6 fid), ClientEvent (Client.GroupFileLearned team fid inf) ]
+        chat = shown (model' shared)
+    texts chat `shouldContain` ["notes.txt", "2.0 KB \x00B7 Offered"]
+    tapOn "Download" chat `shouldBe` Just (T.GroupFileDownload team fid)
+
   it "attaches with the chat's one button until there is something to send" $ do
     let empty = tappedIn (shown (model' [Open (Chat alice)]))
-        written = tappedIn (shown (model' [Open (Chat alice), DraftChanged "hi"]))
+        written = tappedIn (shown (model' [Open (Chat alice), DraftChanged "hi" (at 1 0 0)]))
     (T.Attach `elem` empty, T.Send `elem` empty) `shouldBe` (True, False)
     (T.Attach `elem` written, T.Send `elem` written) `shouldBe` (False, True)
 
-  it "lists the contacts, each opening its chat" $ do
+  it "lists the contacts, each opening its chat and holding its menu" $ do
     texts (shown sample) `shouldContain` ["Alice", "Looks good already.", "9:02 AM", "1"]
     tapOn "Bob" (shown sample) `shouldBe` Just (T.OpenChat bob)
+    heldIn (shown sample) `shouldContain` [T.HoldChat alice, T.HoldChat bob]
 
   it "lists the other profiles in the drawer, to switch to" $ do
     let work = ProfileSummary "Work" "AB12" Nothing ViaUdp 3
@@ -114,6 +165,20 @@ spec = do
 
   it "names the app and the profile over the chats" $
     texts (shown sample) `shouldContain` ["hTox (Tox User)"]
+
+  it "shows a message only up to its first zero byte, and what's hidden in its details" $ do
+    let received = [ClientEvent (Client.Received alice (at 3 9 0) Tox.MessageNormal "hi\0secret")]
+        screens = [model' received, model' (received ++ [Open (Chat alice)])]
+    map (elem "hi" . texts . shown) screens `shouldBe` [True, True]
+    any (Text.isInfixOf "secret") (concatMap (texts . shown) screens) `shouldBe` False
+    texts (shown (model' (received ++ [Open (MessageInfo (Client.FriendChat alice) (messageAt alice 3 (model' received)))])))
+      `shouldContain` ["Hidden after a zero byte", "736563726574"]
+
+  it "shows a friend typing in the chats and in their chat, until they stop" $ do
+    let typing = [ClientEvent (Client.FriendTyping alice True)]
+    texts (shown (model' typing)) `shouldContain` ["typing\x2026"]
+    texts (shown (model' (typing ++ [Open (Chat alice)]))) `shouldContain` ["typing\x2026"]
+    texts (shown (model' (typing ++ [ClientEvent (Client.FriendTyping alice False)]))) `shouldNotContain` ["typing\x2026"]
 
   it "names a contact by the start of its key until it has a name" $
     tapOn "19A974C2" (shown (model' [ClientEvent (Client.AcceptRequest carol)])) `shouldBe` Just (T.OpenChat carol)
@@ -168,6 +233,23 @@ spec = do
     tapOn "Back up" (shown (model' [accounts, Open BackupScreen, ToggleBackup (ProfileId 0), ToggleBackup (ProfileId 7)]))
       `shouldBe` Nothing
 
+  it "asks for a profile's password, showing when it was wrong" $ do
+    let page = shown (model' [Open UnlockScreen, PasswordChanged "secret"])
+    tapOn "Import" page `shouldBe` Just T.Unlock
+    texts (shown (model' [Open UnlockScreen, Notify "Wrong password"])) `shouldContain` ["Wrong password"]
+    modelScreen (model' [Open UnlockScreen, Back]) `shouldBe` ProfilesScreen
+
+  it "pairs a device with a link, and lists the devices to remove" $ do
+    let pairing = [Open ProfileScreen, Open DevicesScreen, ClientEvent (Client.Pair "c0de" (at 3 9 0))]
+        tablet = ContactId (Text.replicate 32 "DD")
+    tapOn "Linked devices" (shown (model' [Open ProfileScreen])) `shouldBe` Just T.OpenDevices
+    tapOn "Link a device" (shown (model' [Open DevicesScreen])) `shouldBe` Just T.PairDevice
+    texts (shown (model' pairing)) `shouldContain` ["tox:" <> toxId (Text.replicate 8 "5A17ED00") "0BADF00D" <> "?pair=c0de"]
+    let paired = shown (model' (pairing ++ [ClientEvent (Client.Requested tablet "pair:c0de")]))
+    texts paired `shouldContain` ["Device", "DDDDDDDD"]
+    tapOn "Link a device" paired `shouldBe` Just T.PairDevice
+    tappedIn paired `shouldContain` [T.RemoveDevice tablet]
+
   it "says there are no chats yet" $
     texts (shown initial) `shouldContain` ["No chats yet"]
 
@@ -177,7 +259,7 @@ spec = do
     tapOn "Toxing on Haskell" drawer `shouldBe` Just T.OpenProfile
 
   it "shows the chat's messages by day, and its draft" $ do
-    let model = model' [Open (Chat alice), DraftChanged "typing"]
+    let model = model' [Open (Chat alice), DraftChanged "typing" (at 1 0 0)]
     mapM_ (\t -> texts (shown model) `shouldContain` [t])
       [ "Yesterday", "Hi! Is this the Haskell client?", "3:14 PM"
       , "Today", "Looks good already.", "typing" ]
@@ -190,13 +272,13 @@ spec = do
       `shouldContain` ["Nov 1, 2026"]
 
   it "shows the time of a run's last message only" $ do
-    let run = [Open (Chat bob), DraftChanged "one", Send (at 2 12 0), DraftChanged "two", Send (at 2 12 1)]
+    let run = [Open (Chat bob), DraftChanged "one" (at 1 0 0), Send (at 2 12 0), DraftChanged "two" (at 1 0 0), Send (at 2 12 1)]
         times = filter (== "12:00 PM") (texts (shown (model' run)))
     times `shouldBe` []
     texts (shown (model' run)) `shouldContain` ["12:01 PM"]
 
   it "lists the latest chat first, with a draft where there is one" $ do
-    let model = model' [Open (Chat bob), DraftChanged "for Bob", Send (at 2 13 0), Open (Chat alice), DraftChanged "unsent", Back]
+    let model = model' [Open (Chat bob), DraftChanged "for Bob" (at 1 0 0), Send (at 2 13 0), Open (Chat alice), DraftChanged "unsent" (at 1 0 0), Back]
         listed = texts (shown model)
     filter (`elem` ["Alice", "Bob"]) listed `shouldBe` ["Bob", "Alice"]
     listed `shouldContain` ["Draft: ", "unsent"]
@@ -242,7 +324,7 @@ spec = do
     texts replying `shouldContain` ["> Hi! Is this the Haskell client?"]
 
   it "tells when a message went and came" $ do
-    let info n = texts (shown (model' [Open (MessageInfo alice (messageAt alice n sample))]))
+    let info n = texts (shown (model' [Open (MessageInfo (Client.FriendChat alice) (messageAt alice n sample))]))
     info 1 `shouldContain` ["Sent", "Nov 1, 2026 3:15 PM", "Delivered", "Nov 1, 2026 3:16 PM"]
     info 0 `shouldContain` ["Received", "Nov 1, 2026 3:14 PM"]
 
@@ -252,7 +334,7 @@ spec = do
         page = texts screen
     tapOn "Export" screen `shouldBe` Just T.ExportDebug
     mapM_ (\line -> page `shouldContain` [line])
-      [ "Heap 20 MB after the last GC, at most 30 MB after a major one", "Render: 4.5 ms \x00d7\&3, worst 2.0 ms"
+      [ "Database version 3", "Heap 20 MB after the last GC, at most 30 MB after a major one", "Render: 4.5 ms \x00d7\&3, worst 2.0 ms"
       , "tox main loop (blocked on BlockedOnSTM)", "Shared keys: 3000 of 2048", "UDP sent NodesRequest: 10, 20 KB" ]
     page `shouldNotContain` ["TCP relays: 0"]
 
@@ -275,6 +357,23 @@ spec = do
     tapOn "notes.pdf" chat `shouldBe` Just (T.TapMessage alice i)
     tapOn "Accept" chat `shouldBe` Just (T.TapMessage alice i)
     tapOn "Decline" chat `shouldBe` Just (T.CancelFile alice i)
+
+  it "sends our file again once it wasn't sent, but not theirs" $ do
+    let ours = map ClientEvent [Client.Stage alice (StagedFile "/sent/notes.pdf" "notes.pdf" 2048 "id"), Client.Send (Client.FriendChat alice) (at 3 9 0)]
+        i = messageAt alice 3 (model' ours)
+        chat events = shown (model' (events ++ [Open (Chat alice)]))
+    tapOn "Send again" (chat ours) `shouldBe` Nothing
+    texts (chat (ours ++ [ClientEvent (Client.Cancel alice i)])) `shouldContain` ["2.0 KB \x00B7 Not sent", "Send again"]
+    tapOn "Send again" (chat (ours ++ [ClientEvent (Client.Cancel alice i)])) `shouldBe` Just (T.SendAgain alice i)
+    let theirs = ClientEvent (Client.FileOffered alice (Receiving 0) (at 3 9 0) "b.pdf" (autoAccepted + 1) "/received/b.pdf" "b")
+    tapOn "Send again" (chat [theirs, ClientEvent (Client.Cancel alice (messageAt alice 3 (model' [theirs])))]) `shouldBe` Nothing
+
+  it "shows a call a linked device took, which can only be hung up here" $ do
+    let talking = model' [ClientEvent (Client.CallInvited alice (at 3 9 0) True), ClientEvent (Client.AnswerCall (UTCTime (fromGregorian 2026 11 2) 43075) False)]
+        client = modelClient talking
+        relayed = shown talking { modelClient = client { clientCall = (\c -> c { callDevice = Just (ContactId "DD") }) <$> clientCall client } }
+    texts relayed `shouldContain` ["On a linked device \x00B7 2:05"]
+    tappedIn relayed `shouldBe` [T.HideCall, T.HangUp]
 
   it "shows a call over the screen, with how long it has gone" $ do
     let ringing = shown (model' [Open (Chat bob), ClientEvent (Client.CallInvited alice (at 3 9 0) False)])

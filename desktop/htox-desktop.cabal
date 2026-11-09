@@ -1,0 +1,26 @@
+cabal-version: 3.0
+name:          htox-desktop
+synopsis:      hTox on the desktop
+version:       0.1.0
+license:       GPL-3.0-only
+build-type:    Simple
+author:        iphy
+maintainer:    iphy
+copyright:     Copyright (c) 2026 The TokTok Team
+homepage:      https://toktok.ltd
+category:      Network
+data-dir:      ../platform/res/drawable
+data-files:    *.xml
+
+executable htox
+  default-language: Haskell2010
+  main-is:          Main.hs
+  other-modules:    Paths_htox_desktop
+  autogen-modules:  Paths_htox_desktop
+  -- Hatter's Qt platform has the program's C main.
+  ghc-options:      -Wall -threaded -no-hs-main
+  build-depends:
+      base             <5
+    , hatter
+    , hatter-qt
+    , htox

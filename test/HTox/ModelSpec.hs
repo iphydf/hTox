@@ -33,6 +33,11 @@ spec = do
     commands [Open DebugScreen] (ClientEvent (Client.Tick (at 3 9 0))) `shouldBe` [MeasureDebug]
     commands [] (ClientEvent (Client.Tick (at 3 9 0))) `shouldBe` []
 
+  it "tells a friend we're typing as their chat's draft changes, but no group" $ do
+    commands [Open (Chat alice)] (DraftChanged "h" (at 3 9 0)) `shouldContain` [Client.SetTyping alice True]
+    commands [Open (Chat alice)] (DraftChanged " " (at 3 9 0)) `shouldBe` []
+    commands [Open (GroupChat team)] (DraftChanged "h" (at 3 9 0)) `shouldBe` []
+
   it "drops the notice when the profiles change" $
     modelNotice (applying [Open ProfilesScreen, Notify "hTox has those profiles already", ProfilesChanged []] sample)
       `shouldBe` Nothing
@@ -41,8 +46,8 @@ spec = do
     let events = [ ClientEvent (Client.Invited alice team NgcGroup "Team" "invite"), AnswerInvite alice team True
                  , ClientEvent (Client.MemberJoined team (at 3 9 0) 1 dana), ClientEvent (Client.GroupConnected team (at 3 9 0)), Back
                  , ClientEvent (Client.MuteGroup team Nothing)
-                 , ClientEvent (Client.GroupReceived team (at 3 9 1) 1 Tox.MessageNormal "lunch?")
-                 , ClientEvent (Client.GroupReceived team (at 3 9 2) 1 Tox.MessageNormal "tox user, lunch?") ]
+                 , ClientEvent (Client.GroupReceived team (at 3 9 1) 1 Tox.MessageNormal "lunch?" Nothing)
+                 , ClientEvent (Client.GroupReceived team (at 3 9 2) 1 Tox.MessageNormal "tox user, lunch?" Nothing) ]
         shown evs = Map.lookup team (groupNotifications (at 3 9 3) (modelClient (applying evs sample)))
     shown events `shouldBe` Just ["Dana: tox user, lunch?"]
     shown (events ++ [ClientEvent (Client.ToggleMentions team)]) `shouldBe` Nothing
@@ -52,9 +57,9 @@ spec = do
         events = [ ClientEvent (Client.Invited alice team NgcGroup "Team" "invite"), AnswerInvite alice team True
                  , ClientEvent (Client.MemberJoined team (at 3 9 0) 1 dana), ClientEvent (Client.MemberJoined team (at 3 9 0) 2 bridge)
                  , ClientEvent (Client.GroupConnected team (at 3 9 0)), Back, ClientEvent (Client.MuteGroup team Nothing)
-                 , ClientEvent (Client.GroupReceived team (at 3 9 1) 2 Tox.MessageNormal "<Bob> hi")
-                 , ClientEvent (Client.GroupReceived team (at 3 9 2) 1 Tox.MessageNormal "<Dana> is me")
-                 , ClientEvent (Client.GroupReceived team (at 3 9 3) 2 Tox.MessageNormal "<Carol> tox user, lunch?") ]
+                 , ClientEvent (Client.GroupReceived team (at 3 9 1) 2 Tox.MessageNormal "<Bob> hi" Nothing)
+                 , ClientEvent (Client.GroupReceived team (at 3 9 2) 1 Tox.MessageNormal "<Dana> is me" Nothing)
+                 , ClientEvent (Client.GroupReceived team (at 3 9 3) 2 Tox.MessageNormal "<Carol> tox user, lunch?" Nothing) ]
         relaying = applying (events ++ [ClientEvent (Client.ChooseRelayBot team (Just (memberKey bridge)))]) sample
         g = groupOf relaying
     fmap relayCounts g `shouldBe` Just [(bridge, 2, 2), (dana, 1, 1)]
@@ -81,6 +86,7 @@ spec = do
     unread [Shown True, Open (Chat alice), more] `shouldBe` Just 0
     unread [Shown True, Open (Chat alice), Shown False, more] `shouldBe` Just 1
     unread [Open (Chat alice), more, Shown True] `shouldBe` Just 0
+    unread [Shown True, Open (Details alice), more, Back] `shouldBe` Just 0
 
   it "notifies of each contact's unread messages" $ do
     let notified events = Map.lookup alice (notifications (at 3 9 0) (modelClient (applying events sample)))
@@ -126,7 +132,7 @@ spec = do
     modelNotice (applying (Open ProxyScreen : socks ++ [ApplyProxy]) sample) `shouldBe` Just "The port is a number from 1 to 65535"
 
   it "keeps each chat's draft" $ do
-    let model = applying [Open (Chat alice), DraftChanged "for Alice", Back, Open (Chat bob)] sample
+    let model = applying [Open (Chat alice), DraftChanged "for Alice" (at 1 0 0), Back, Open (Chat bob)] sample
     Map.lookup alice (clientDrafts (modelClient model)) `shouldBe` Just "for Alice"
     Map.lookup bob (clientDrafts (modelClient model)) `shouldBe` Nothing
 
@@ -143,7 +149,7 @@ spec = do
   it "sums for the other profiles what is unread in chats that aren't muted" $ do
     let unread events = summaryUnread (profileSummary (at 3 9 0) (modelClient (applying events sample)))
         more = ClientEvent (Client.Received alice (at 3 9 0) Tox.MessageNormal "more")
-        -- Alice's one, and the other chats'.
+        -- Alice's one unread message, and the other chats' unread ones.
         earlier = unread []
     unread [more] `shouldBe` earlier + 1
     unread [more, ClientEvent (Client.MuteChat alice Nothing)] `shouldBe` earlier - 1
@@ -174,8 +180,8 @@ spec = do
 
   it "copies one message as its text, several with whose they were" $ do
     let message n = messageAt alice n sample
-    copiedText (modelClient sample) alice [message 1] `shouldBe` "It is, and it's on the network now."
-    copiedText (modelClient sample) alice [message 1, message 0] `shouldBe` "Alice: Hi! Is this the Haskell client?\nTox User: It is, and it's on the network now."
+    copiedText (modelClient sample) (Client.FriendChat alice) [message 1] `shouldBe` "It is, and it's on the network now."
+    copiedText (modelClient sample) (Client.FriendChat alice) [message 1, message 0] `shouldBe` "Alice: Hi! Is this the Haskell client?\nTox User: It is, and it's on the network now."
 
   it "counts what comes while the chat is scrolled away, until it is back" $ do
     let away = [Open (Chat alice), ScrolledAway True, ClientEvent (Client.Received alice (at 3 9 0) Tox.MessageNormal "one")]
@@ -219,7 +225,7 @@ spec = do
     let events =
           [ ClientEvent (Client.Invited alice team NgcGroup "Team" "invite"), AnswerInvite alice team True
           , ClientEvent (Client.MemberJoined team (at 3 9 0) 1 dana), ClientEvent (Client.GroupConnected team (at 3 9 0))
-          , ClientEvent (Client.GroupReceived team (at 3 9 2) 1 Tox.MessageNormal "hi"), Back ]
+          , ClientEvent (Client.GroupReceived team (at 3 9 2) 1 Tox.MessageNormal "hi" Nothing), Back ]
     Map.lookup team (groupNotifications (at 3 9 4) (modelClient (applying events sample))) `shouldBe` Just ["Dana: hi"]
 
   it "founds a named group and opens it, and joins only by a whole chat ID" $ do
@@ -236,7 +242,7 @@ spec = do
     let inGroup = [ ClientEvent (Client.Invited alice team NgcGroup "Team" "invite"), AnswerInvite alice team True
                   , ClientEvent (Client.MemberJoined team (at 3 9 0) 1 dana), ClientEvent (Client.GroupConnected team (at 3 9 0)) ]
         -- Like the member menu on the group page.
-        written = inGroup ++ [Open (GroupDetails team), PrivatelyTo (Just (memberKey dana)), Open (GroupChat team), DraftChanged "psst"]
+        written = inGroup ++ [Open (GroupDetails team), PrivatelyTo (Just (memberKey dana)), Open (GroupChat team), DraftChanged "psst" (at 1 0 0)]
     commands written (Send (at 3 9 1)) `shouldBe` [SendPrivate team (entryAt team 0 (applying (written ++ [Send (at 3 9 1)]) sample)) 1 "psst"]
     let heard = applying (inGroup ++ [Back, ClientEvent (Client.MuteGroup team Nothing)
                                      , ClientEvent (Client.PrivateReceived team (at 3 9 2) 1 Tox.MessageNormal "hush")]) sample
@@ -263,7 +269,7 @@ spec = do
     map (preview "Alice") (drop 3 (messagesOf alice (applying shared sample))) `shouldBe` ["\x1F4CD Location"]
 
   it "forwards to the chosen contact and opens its chat" $
-    modelScreen (applying [Open (Forward alice [messageAt alice 0 sample]), ForwardTo bob (at 3 9 0)] sample) `shouldBe` Chat bob
+    modelScreen (applying [Open (Forward (Client.FriendChat alice) [messageAt alice 0 sample]), ForwardTo bob (at 3 9 0)] sample) `shouldBe` Chat bob
 
   it "adds a contact by Tox ID with our request, and opens its chat" $ do
     let key = Text.replicate 8 "0123ABCD"

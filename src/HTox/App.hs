@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE StrictData        #-}
 {-# LANGUAGE TupleSections     #-}
 {-# LANGUAGE TypeApplications  #-}
 -- | App state, the actions widgets fire, and the Tox behind them.
@@ -11,14 +12,17 @@ import           Control.Concurrent        (ThreadId, forkIO, killThread,
                                             threadDelay)
 import           Control.Concurrent.Chan   (newChan, readChan, writeList2Chan)
 import           Control.Concurrent.MVar   (MVar, modifyMVar, modifyMVar_,
-                                            newMVar, readMVar, withMVar)
+                                            newEmptyMVar, newMVar, readMVar,
+                                            takeMVar, tryPutMVar, tryTakeMVar,
+                                            withMVar)
 import           Control.Exception         (Exception (..), IOException,
                                             SomeException (..), evaluate,
                                             onException, throwIO, try)
-import           Control.Monad             (forM, forM_, forever, join, unless,
-                                            void, when, (<=<))
+import           Control.Monad             (forM, forM_, forever, guard, join,
+                                            unless, void, when, (<=<))
 import           Crypto.Saltine.Core.Utils (randomByteString)
 import qualified Data.ByteString           as BS
+import qualified Data.ByteString.Base16    as Base16
 import qualified Data.ByteString.Internal  as BS
 import           Data.Char                 (toLower)
 import           Data.Int                  (Int16)
@@ -31,6 +35,7 @@ import           Data.Maybe                (catMaybes, fromMaybe, isJust,
                                             isNothing)
 import qualified Data.Set                  as Set
 import qualified Data.Text                 as Text
+import qualified Data.Text.Encoding        as Text
 import qualified Data.Text.IO              as Text
 import           Data.Time                 (NominalDiffTime, UTCTime,
                                             addUTCTime, defaultTimeLocale,
@@ -41,6 +46,7 @@ import           Data.Time.Clock.POSIX     (utcTimeToPOSIXSeconds)
 import qualified Data.Vector.Storable      as V
 import           Data.Word                 (Word64)
 import           Foreign.ForeignPtr        (castForeignPtr)
+import           GHC.Clock                 (getMonotonicTime)
 import           GHC.Conc                  (labelThread, myThreadId)
 import           Hatter                    (CallButton (..),
                                             LifecycleEvent (..), MobileApp (..),
@@ -59,9 +65,9 @@ import           Hatter.BottomSheet        (BottomSheetAction (..),
                                             BottomSheetConfig (..),
                                             showBottomSheet)
 import           Hatter.CallAudio          (CallAudio, CallRoute, CallTone (..),
-                                            playCallAudio, setCallRoute,
-                                            setCallTone, startCallAudio,
-                                            stopCallAudio)
+                                            callAudioLatency, playCallAudio,
+                                            setCallRoute, setCallTone,
+                                            startCallAudio, stopCallAudio)
 import qualified Hatter.CallAudio          as CallAudio
 import           Hatter.CallVideo          (CallCamera, VideoFrame (..),
                                             showVideoFrame, startCallCamera,
@@ -71,8 +77,6 @@ import           Hatter.DeviceInfo         (DeviceInfo (..), getDeviceInfo)
 import           Hatter.Dialog             (DialogAction (..),
                                             DialogConfig (..), showDialog)
 import           Hatter.FilesDir           (getAppFilesDir)
-import           Hatter.Http               (HttpMethod (..), HttpRequest (..),
-                                            HttpResponse (..), performRequest)
 import           Hatter.Location           (LocationData (..),
                                             startLocationUpdates,
                                             stopLocationUpdates)
@@ -96,28 +100,34 @@ import           System.FilePath           (dropExtension, takeDirectory,
                                             takeExtension, takeFileName, (</>))
 import           System.IO                 (IOMode (..), hFileSize, withFile)
 import qualified Tox.Application.Tox       as Tox
-import           Tox.AV                    (Picture (..))
+import           Tox.AV                    (AudioFrame (AudioFrame),
+                                            Picture (..))
 import           Tox.Client                (initialClient)
 import qualified Tox.Client.Avatars        as Avatars
 import qualified Tox.Client.Debug          as Debug
 import           Tox.Client.Export         (exportSave)
-import qualified Tox.Client.Formats        as Formats
+import qualified Tox.Client.Home           as Home
 import           Tox.Client.Identicon      (identicon, identiconPng)
-import           Tox.Client.Import         (ImportError (..), importSave)
+import           Tox.Client.Import         (ImportError (..), importSave,
+                                            unlockSave)
 import           Tox.Client.Locations      (location, mapsUri)
 import qualified Tox.Client.Network        as Network
-import           Tox.Client.Nodes          (Node, builtIn, nodesUrl, readNodes)
+import           Tox.Client.Nodes          (builtIn)
 import           Tox.Client.Pictures       (PictureFormat (..), pictureFormat,
                                             pictureFormats)
 import           Tox.Client.Qoi            (isQoi, qoiBitmap, qoiSize)
 import           Tox.Client.QrCode         (toxIdQr)
+import           Tox.Client.Types          (entryText, shownText)
 import qualified Tox.Client.Update         as Client
 import qualified Tox.Core.Lanes            as Lanes
 import           Tox.Core.Lanes            (Lanes)
+import qualified Tox.Sync.Id               as Sync
 import qualified Tox.Sync.Pairing          as Pairing
 
 import           HTox.Links                (findLinks)
 import           HTox.Model
+import           HTox.Playback             (Output (..), pumpAudio)
+import           HTox.Private              (private)
 import qualified HTox.Store                as Store
 import           HTox.Theme                (dp, theme)
 import           HTox.View
@@ -218,7 +228,8 @@ notify hub pid owns old new = do
       Just c | callPhase c == Ringing, not (modelShown model) -> Just c
       _                                                       -> Nothing
 
--- | Nothing when the profile goes away.
+-- | Records a profile's connection to Tox ('Nothing' once the profile stops),
+-- and shows the best of all profiles' in the service notification.
 connected :: Hub -> ProfileId -> Maybe Connection -> IO ()
 connected hub pid connection = modifyMVar_ (hubConnections hub) $ \known -> do
   let known' = Map.alter (const connection) pid known
@@ -239,7 +250,8 @@ debugSampleSeconds :: Int
 debugSampleSeconds = 10
 
 
--- | Each profile's Tox and what its model holds, and the rest once.
+-- | Each profile's Tox and what its model holds, and the process's numbers
+-- once.
 debugSample :: Map.Map ProfileId Session -> IO ([(Text.Text, Int)], Map.Map Text.Text Debug.Report)
 debugSample sessions = do
   measured <- forM (Map.toList sessions) $ \(ProfileId pid, s) -> do
@@ -260,6 +272,15 @@ callNotification = "call"
 
 pcmBytes :: V.Vector Int16 -> BS.ByteString
 pcmBytes pcm = let (p, n) = V.unsafeToForeignPtr0 pcm in BS.fromForeignPtr0 (castForeignPtr p) (n * 2)
+
+-- | Where Hatter plays call audio.
+callOutput :: Output
+callOutput = Output
+  { outPlay = \(AudioFrame rate channels pcm) -> playCallAudio rate channels (pcmBytes pcm)
+  , outLatency = callAudioLatency
+  , outClock = getMonotonicTime
+  , outSleep = threadDelay
+  }
 
 bytesPcm :: BS.ByteString -> V.Vector Int16
 bytesPcm bytes = let (p, n) = BS.toForeignPtr0 bytes in V.unsafeFromForeignPtr0 (castForeignPtr p) (n `div` 2)
@@ -298,13 +319,15 @@ data Picking = ForPicture | ForFile | ForProfile | ForBackup
   deriving (Eq)
 
 data Media = Media
-  { mediaAudio  :: IORef (Maybe CallAudio)
-  , mediaCamera :: IORef (Maybe CallCamera)
-  , mediaMuted  :: IORef Bool
+  { mediaAudio   :: IORef (Maybe CallAudio)
+  , mediaCamera  :: IORef (Maybe (CallCamera, ThreadId))
+    -- ^ Filming, and sending what it films.
+  , mediaMuted   :: IORef Bool
+  , mediaPlayers :: IORef [ThreadId] -- ^ Playing the call's audio and showing its video.
   }
 
-callMedia :: Network.Network -> Media -> (Route -> [Route] -> IO ()) -> Model -> Model -> IO ()
-callMedia network media onRoutes old new = do
+callMedia :: Lanes -> Network.Network -> Media -> (Route -> [Route] -> IO ()) -> Model -> Model -> IO ()
+callMedia lanes network media onRoutes old new = do
   case (talking old, talking new) of
     (Nothing, Just cid) -> do
       let speaker = callRoute (modelPhoneCall new) == Speaker
@@ -314,31 +337,53 @@ callMedia network media onRoutes old new = do
       started <- startCallAudio audioRate audioFrame speaker sending $ \route routes ->
         onRoutes (fromCallRoute route) (map fromCallRoute routes)
       writeIORef (mediaAudio media) (Just started)
-    (Just _, Nothing) -> stopping (mediaAudio media) stopCallAudio
+      players <- sequence
+        [ forkNamed "htox call audio" (pumpAudio lanes callOutput (Network.pullAudio network cid))
+        , forkNamed "htox call video" (showPictures lanes network cid)
+        ]
+      writeIORef (mediaPlayers media) players
+    (Just _, Nothing) -> do
+      readIORef (mediaPlayers media) >>= mapM_ killThread
+      writeIORef (mediaPlayers media) []
+      stopping (mediaAudio media) stopCallAudio
     _ -> pure ()
   -- Restart with the other camera when the user flips it.
   when (filming old /= filming new) $ do
-    stopping (mediaCamera media) stopCallCamera
+    stopping (mediaCamera media) (\(camera, sender) -> stopCallCamera camera >> killThread sender)
     forM_ (filming new) $ \(cid, backCamera) -> do
+      -- The latest frame waits for its own thread to send it, so the camera
+      -- never waits for the encoder, and frames it films meanwhile are
+      -- left out.
+      latest <- newEmptyMVar
+      sender <- forkNamed "htox call camera" . forever $ takeMVar latest >>= Network.sendVideo network cid . framePicture
       started <- startCallCamera (not backCamera) $ \frame -> do
         -- Mirror our own view (the friend gets it unmirrored).
         showVideoFrame selfStream (if backCamera then frame else mirrored frame)
-        Network.sendVideo network cid (framePicture frame)
-      writeIORef (mediaCamera media) (Just started)
+        tryTakeMVar latest >> void (tryPutMVar latest frame)
+      writeIORef (mediaCamera media) (Just (started, sender))
   writeIORef (mediaMuted media) (maybe False callMuted (clientCall (modelClient new)))
-  let tone model = case callPhase <$> clientCall (modelClient model) of
-        Just Ringing | modelShown model -> Ringtone
-        Just Calling                    -> Ringback
-        _                               -> Quiet
+  let tone model = case clientCall (modelClient model) of
+        Just c | isJust (callDevice c)                 -> Quiet
+               | callPhase c == Ringing, modelShown model -> Ringtone
+               | callPhase c == Calling                -> Ringback
+        _                                              -> Quiet
   when (tone old /= tone new) $ setCallTone (tone new)
   where
+    -- Not one a linked device took: we only relay that.
     talking model = case clientCall (modelClient model) of
-      Just c | Talking _ <- callPhase c -> Just (callTarget c)
-      _                                 -> Nothing
+      Just c | Talking _ <- callPhase c, isNothing (callDevice c) -> Just (callTarget c)
+      _ -> Nothing
     filming model = case clientCall (modelClient model) of
       Just c | callCamera c -> (, callBackCamera (modelPhoneCall model)) <$> talking model
       _                     -> Nothing
     stopping ref stop = readIORef ref >>= mapM_ stop >> writeIORef ref Nothing
+
+-- | Every 16 ms, about a screen refresh, shows the call's picture that's due
+-- by the time the next one shows.
+showPictures :: Lanes -> Network.Network -> ContactId -> IO ()
+showPictures lanes network cid = forever $ do
+  threadDelay 16000
+  Network.dueVideo network cid 33 >>= mapM_ (Lanes.timed lanes "Call video display" . showVideoFrame peerStream . pictureFrame)
 
 fromCallRoute :: CallRoute -> Route
 fromCallRoute = \case
@@ -428,6 +473,8 @@ data ContactActions = ContactActions
   , caForwardTo :: Action
   , caCallBack  :: Action
   , caPictures  :: Action
+  , caHold      :: Action
+    -- ^ The chat list's menu of the chat.
   }
 
 data GroupActions = GroupActions
@@ -446,6 +493,9 @@ data GroupActions = GroupActions
   , gaVoice     :: Action
   , gaRelayBot  :: Action
   , gaStopRelay :: Action
+  , gaPictures  :: Action
+  , gaHold      :: Action
+    -- ^ As 'caHold'.
   }
 
 data InviteActions = InviteActions
@@ -467,8 +517,6 @@ data Hub = Hub
   , hubSessions    :: MVar (Map.Map ProfileId Session)
   , hubShown       :: IORef ProfileId
   , hubRedraw      :: IORef (IO ())
-  , hubNodes       :: IORef [Node]
-  , hubFetched     :: IORef Bool
   , hubMedia       :: Media
   , hubCall        :: IORef (Maybe (ProfileId, Call))
     -- ^ Profile with the call, and the call. There's at most 1 (we have 1
@@ -477,6 +525,8 @@ data Hub = Hub
   , hubNamed       :: IORef Bool
     -- ^ Name the profile in notifications (more than 1 is online).
   , hubWatch       :: ThreadId
+  , hubWriting     :: ThreadId
+    -- ^ Writes what the profiles save, so their events don't wait for it.
   , hubLanes       :: Lanes
     -- ^ Time hTox spends on each kind of work, in all profiles.
   , hubSummaries   :: IORef (Map.Map ProfileId ProfileSummary)
@@ -491,7 +541,8 @@ data Session = Session
   , sessionStop    :: IO ()
   }
 
--- | Others that can't start stay offline.
+-- | Puts every profile online. It fails if the shown one can't go online,
+-- while others that can't stay offline.
 newHub :: IORef (IO ()) -> IO Hub
 newHub redraw = do
   dir <- getAppFilesDir
@@ -502,13 +553,12 @@ newHub redraw = do
   database <- Store.open key (dir </> "tox.db")
   mapM_ (createDirectoryIfMissing True) [dir </> "received", dir </> "sent"]
   shown <- Store.activeProfile database
-  -- Last fetched node list, until we fetch a new one.
-  cached <- either (const Nothing) readNodes <$> try @IOException (BS.readFile (dir </> "nodes.json"))
   sessions <- newMVar Map.empty
-  media <- Media <$> newIORef Nothing <*> newIORef Nothing <*> newIORef False
+  media <- Media <$> newIORef Nothing <*> newIORef Nothing <*> newIORef False <*> newIORef []
+  lanes <- Lanes.newLanes
+  writing <- forkNamed "htox writing" (Store.writing platformLog (Lanes.timed lanes "Writing") database)
   -- With stay online off, stop a while after hTox is closed (not during a
   -- call).
-  lanes <- Lanes.newLanes
   watchThread <- forkNamed "htox stay online" $ do
     let watch since = do
           threadDelay 5000000
@@ -519,9 +569,9 @@ newHub redraw = do
             else if diffUTCTime now since >= stayGrace then stopBackground else watch since
     getCurrentTime >>= watch
   hub <- Hub database dir sessions
-    <$> newIORef shown <*> pure redraw <*> newIORef (fromMaybe builtIn cached) <*> newIORef False
+    <$> newIORef shown <*> pure redraw
     <*> pure media <*> newIORef Nothing <*> newMVar Map.empty <*> newIORef False <*> pure watchThread
-    <*> pure lanes <*> newIORef Map.empty
+    <*> pure writing <*> pure lanes <*> newIORef Map.empty
   -- Where time and memory went, kept in files for the debug export, and once
   -- a minute in the log for whoever reads it.
   logged <- newIORef Map.empty
@@ -538,7 +588,7 @@ newHub redraw = do
   setServiceStatus (connectionText Offline)
   -- If the shown profile can't go online, stop the watch too, or it stops
   -- the app while the user is about to try again.
-  void (sessionFor hub shown) `onException` killThread watchThread
+  void (sessionFor hub shown) `onException` mapM_ killThread [watchThread, writing]
   others <- filter (/= shown) . map accountId <$> Store.profiles database
   forM_ others $ \pid -> try @SomeException (sessionFor hub pid) >>= \case
     Left err -> platformLog ("A profile didn't go online: " <> Text.pack (displayException err))
@@ -550,6 +600,8 @@ stopHub :: Hub -> IO ()
 stopHub hub = do
   killThread (hubWatch hub)
   modifyMVar_ (hubSessions hub) $ \sessions -> Map.empty <$ mapM_ sessionStop sessions
+  killThread (hubWriting hub)
+  Store.flush (hubDatabase hub)
 
 -- | Goes online first if it isn't.
 sessionFor :: Hub -> ProfileId -> IO Session
@@ -584,27 +636,19 @@ online hub pid = do
   settings <- clientDevice . modelClient <$> readMVar model
   -- Cancel a call that was ringing when hTox last stopped.
   cancelNotification (keyed pid callNotification)
-  nodes <- readIORef (hubNodes hub)
-  network <- either (throwIO . ToxFailed) pure =<< Network.start platformLog lanes identity settings (hubDir hub </> "received") nodes
+  network <- either (throwIO . ToxFailed) pure =<< Network.start platformLog lanes identity settings (hubDir hub </> "received") builtIn
   unless (isJust identity) $ Network.identityOf network >>= Store.saveIdentity store
-  Network.onMedia network Network.Media
-    { Network.playAudio = \rate channels pcm -> do
-        waiting <- Lanes.timed lanes "Call audio playback" $ playCallAudio rate channels (pcmBytes pcm)
-        -- How far behind the audio plays, as a lane for its worst and average.
-        Lanes.took lanes "Call audio behind" (fromIntegral waiting * 1000000)
-    , Network.showVideo = Lanes.timed lanes "Call video display" . showVideoFrame peerStream . pictureFrame
-    }
   -- Run Tox commands in order on their own thread (Tox may be slow, and a
   -- tap shouldn't wait for it).
   asked <- newChan
   let fire event = do
         (commands, busy, device, owns) <- Lanes.timed lanes ("Event " <> Network.constructor event) . modifyMVar model $ \old -> do
           let (new, commands) = update event old
-          Lanes.timed lanes "Saving" $ Store.save store (modelClient old) (modelClient new)
+          Store.save store (modelClient old) (modelClient new)
           owns <- claimCall hub pid old new
           notify hub pid owns old new
           -- Fork (the platform reports routes while we hold the model).
-          when owns $ callMedia network (hubMedia hub)
+          when owns $ callMedia lanes network (hubMedia hub)
             (\route routes -> void . forkNamed "htox route change" $ fire (RoutesChanged route routes) >> redraw)
             old new
           let was = modelClient old
@@ -621,14 +665,18 @@ online hub pid = do
         forM_ device $ \d -> do
           others <- Map.elems . Map.delete pid <$> readMVar (hubSessions hub)
           forM_ others (`sessionFire` ClientEvent (Client.SetDevice d))
+  -- Each command runs once what it changed is written, as Tox can't take it
+  -- back.
   askingThread <- Network.looping network "Asking Tox" $
-    readChan asked >>= (\c -> Lanes.timed lanes ("Command " <> Network.constructor c) (Network.perform network c)) >>= mapM_ (fire . ClientEvent) >> redraw
-  networkThreads <- Network.run network (\event -> fire (ClientEvent event) >> redraw)
-  -- For the call timer and ring timeout, and to measure again on the debug
-  -- screen.
+    readChan asked >>= (\c -> Store.written (hubDatabase hub) >> Lanes.timed lanes ("Command " <> Network.constructor c) (Network.perform network c))
+      >>= mapM_ (fire . ClientEvent) >> redraw
+  networkThreads <- Network.run network (\event -> Store.recalled store event >>= fire . ClientEvent >> redraw)
+  -- For the call timer and ring timeout, to say we stopped typing, and to
+  -- measure again on the debug screen.
   tickThread <- forkNamed "htox ticker" . forever $ do
     threadDelay 1000000
-    ticking <- (\m -> isJust (clientCall (modelClient m)) || modelScreen m == DebugScreen) <$> readMVar model
+    ticking <- (\m -> isJust (clientCall (modelClient m)) || not (Map.null (clientTypingTo (modelClient m)))
+                     || modelScreen m == DebugScreen) <$> readMVar model
     when ticking $ getCurrentTime >>= fire . ClientEvent . Client.Tick >> redraw
   let stop = modifyMVar_ model $ \current -> do
         mapM_ killThread (askingThread : tickThread : networkThreads)
@@ -658,7 +706,7 @@ claimCall hub pid old new = atomicModifyIORef' (hubCall hub) $ \owner -> case (c
   (Just _, Nothing) | (fst <$> owner) == Just pid -> (Nothing, True)
   _                                               -> (owner, False)
 
--- | Shows why hTox didn't start, with a button to try again.
+-- | The app, or why hTox didn't start, with a button to try again.
 app :: IO MobileApp
 app = do
   actions <- newActionState
@@ -718,7 +766,6 @@ running actions hub switch restart = do
   let database = hubDatabase hub
       dir = hubDir hub
       sent = dir </> "sent"
-      nodesFile = dir </> "nodes.json"
       redraw = hubRedraw hub
   shownId <- Store.activeProfile database
   session <- sessionFor hub shownId
@@ -728,11 +775,12 @@ running actions hub switch restart = do
       fire = sessionFire session
   -- Profiles may have changed while it wasn't shown.
   Store.profiles database >>= fire . ProfilesChanged
-  settings <- clientDevice . modelClient <$> readMVar model
   permissions <- newIORef (Nothing :: Maybe PermissionState)
   user <- newIORef (Nothing :: Maybe UserState)
   locating <- newIORef False
   picking <- newIORef ForFile
+  -- A .tox file waiting for its password.
+  locked <- newIORef (Nothing :: Maybe BS.ByteString)
   let stop = fire (Shown False)
       -- A ringing call can't hide, so we stay with it.
       switching next = readMVar model >>= \current -> case callPhase <$> clientCall (modelClient current) of
@@ -741,6 +789,22 @@ running actions hub switch restart = do
           else fire Leave >> Store.setActive database pid >> switch
   let withUser f = readIORef user >>= mapM_ f
       redraw' = join (readIORef redraw)
+      -- Import a .tox file as a profile, online at once, unless we have it
+      -- already.
+      taking bytes = opening bytes (importSave bytes)
+      opening bytes = \case
+        Left Encrypted -> writeIORef locked (Just bytes) >> fire (Open UnlockScreen) >> redraw'
+        Left WrongPassword -> fire (Notify "Wrong password") >> redraw'
+        Left NotAProfile -> fire (Notify "That isn't a Tox profile") >> redraw'
+        Right (known, imported) -> do
+          writeIORef locked Nothing
+          others <- mapM (Store.identity . Store.profileStore database . accountId) =<< Store.profiles database
+          if identitySecretKey known `elem` map identitySecretKey (catMaybes others)
+            then fire (Notify "hTox has that profile already") >> redraw'
+            else switching $ do
+              pid <- Store.newProfile database (Just known) (clientProfile imported)
+              Store.save (Store.profileStore database pid) initialClient imported
+              pure pid
       shareLocation = withUser $ \u -> requestPermission (userPermissionState u) PermissionLocation $ \case
         PermissionDenied -> fire (Notify "hTox may not use your location") >> redraw'
         PermissionGranted -> do
@@ -760,15 +824,20 @@ running actions hub switch restart = do
       takePicture = withUser $ \u -> requestPermission (userPermissionState u) PermissionCamera $ \case
         PermissionDenied -> fire (Notify "hTox may not use the camera") >> redraw'
         PermissionGranted -> capturePicture
-      attaching = withUser $ \u ->
+      attaching = withUser $ \u -> readMVar model >>= \current -> do
+        -- Groups only take files.
+        let choices = filter (\(name, _) -> name /= "Location" || not (inGroup current)) everything
         showBottomSheet (userBottomSheetState u) (BottomSheetConfig "Attach" (map fst choices)) $ \case
           BottomSheetItemSelected n | (_, chosen) : _ <- drop (fromIntegral n) choices -> chosen
           _ -> pure ()
         where
-          choices =
+          everything =
             [ ("Gallery", writeIORef picking ForPicture >> pickFiles "image/*")
             , ("Camera", writeIORef picking ForPicture >> takePicture)
             , ("File", writeIORef picking ForFile >> pickFiles "*/*"), ("Location", shareLocation) ]
+          inGroup current = case modelScreen current of
+            GroupChat _ -> True
+            _           -> False
   -- No call without the microphone, and no video without the camera. We
   -- redraw after the answer (Hatter doesn't).
   let allowing camera next = readIORef permissions >>= \case
@@ -821,7 +890,6 @@ running actions hub switch restart = do
     -- Try these sizes until the PNG is small enough for Tox clients.
     pickAvatar <- createAction (pickPicture [256, 192, 128, 96, 64] Avatars.maxSize)
     removeAvatar <- createAction (fire (ClientEvent Client.RemoveAvatar))
-    -- Write it to our files, then copy it where the user chooses.
     -- The last 30 minutes of debug samples, copied where the user chooses.
     exportDebug <- createAction $ do
       now <- getCurrentTime
@@ -835,6 +903,7 @@ running actions hub switch restart = do
       me <- Network.identityOf network
       forM_ (exportSave me (modelClient current)) $ \save -> do
         let path = dir </> "export.tox"
+        private path
         BS.writeFile path save
         saveFile path (profileNickname (clientProfile (modelClient current)) <> ".tox") "application/octet-stream"
     chooseAway <- createAction $ withUser $ \u ->
@@ -850,8 +919,8 @@ running actions hub switch restart = do
     toggleIpv6 <- toggling (\d -> d { settingIpv6 = not (settingIpv6 d) })
     toggleLan <- toggling (\d -> d { settingLan = not (settingLan d) })
     toggleStay <- toggling (\d -> d { settingStay = not (settingStay d) })
-    toggleFormats <- Map.fromList <$> traverse
-      (\f -> (,) (Formats.formatKey f) <$> createAction (fire (ClientEvent (Client.ToggleFormat (Formats.formatKey f))))) Formats.formats
+    toggleTyping <- createAction $
+      readMVar model >>= fire . ClientEvent . Client.SetTypingIndicators . not . settingTyping . clientAccount . modelClient
     openProxy <- createAction (fire (Open ProxyScreen))
     proxyKinds <- (,,,)
       <$> createAction (fire (ProxyKindChosen Nothing))
@@ -868,7 +937,7 @@ running actions hub switch restart = do
       if settingProxy (clientDevice (modelClient current)) == before || isJust (clientCall (modelClient current))
         then redraw'
         else restart
-    draft <- createOnChange (fire . DraftChanged)
+    draft <- createOnChange (\text -> getCurrentTime >>= fire . DraftChanged text)
     nickname <- createOnChange (fire . NicknameChanged)
     status <- createOnChange (fire . StatusChanged)
     address <- createOnChange (fire . AddressChanged)
@@ -900,12 +969,11 @@ running actions hub switch restart = do
         Store.older (Store.profileStore database shownId) chat oldest >>= fire . ClientEvent) . pageBefore
     jump <- createAction (fire JumpToEnd)
     unselect <- createAction (fire Unselect)
-    let selected f = readMVar model >>= \current -> case modelScreen current of
-          Chat cid -> f current cid (Set.toList (modelSelected current))
-          _        -> pure ()
-    copySelected <- createAction $ selected $ \current cid is ->
-      copyToClipboard (copiedText (modelClient current) cid is) >> fire Unselect
-    forwardSelected <- createAction $ selected $ \_ cid is -> fire (Open (Forward cid is))
+    let selected f = readMVar model >>= \current ->
+          forM_ (openChat current) $ \chat -> f current chat (Set.toList (modelSelected current))
+    copySelected <- createAction $ selected $ \current chat is ->
+      copyToClipboard (copiedText (modelClient current) chat is) >> fire Unselect
+    forwardSelected <- createAction $ selected $ \_ chat is -> fire (Open (Forward chat is))
     cancelReply <- createAction (fire CancelReply)
     password <- createOnChange (fire . PasswordChanged)
     topic <- createOnChange (fire . TopicEdited)
@@ -920,7 +988,21 @@ running actions hub switch restart = do
     groupPassword <- createOnChange (fire . GroupPasswordEdited)
     applyGroupSettings <- createAction (fire ApplyGroupSettings)
     openLink <- createAction (fire (Open LinkScreen))
+    openDevices <- createAction (fire (Open DevicesScreen))
+    -- A new code, which stops working after a while.
+    pairDevice <- createAction $ do
+      code <- Text.decodeUtf8 . Base16.encode <$> randomByteString 16
+      now <- getCurrentTime
+      fire (ClientEvent (Client.Pair code now))
+      void . forkNamed "htox pairing code" $ do
+        threadDelay (floor (Home.pairingTime * 1000000))
+        fire (ClientEvent (Client.Unpair code)) >> redraw'
+    copyPairing <- createAction (readMVar model >>= mapM_ copyToClipboard . pairingLink)
     linkEdited <- createOnChange (fire . LinkEdited)
+    -- Deriving the key takes a moment.
+    unlock <- createAction $ readMVar model >>= \current -> readIORef locked >>= mapM_ (\bytes ->
+      void . forkNamed "htox profile unlocking" $
+        opening bytes =<< evaluate (importSave =<< unlockSave (modelPassword current) bytes))
     -- New profile for the linked account, online at once.
     link <- createAction $ readMVar model >>= \current ->
       case (linkError (modelLink current), Pairing.parseLink (modelLink current)) of
@@ -928,7 +1010,7 @@ running actions hub switch restart = do
           now <- getCurrentTime
           switching (Store.newLinkedProfile database (Pairing.linkAddress pairing) (Pairing.requestMessage pairing) now)
         (why, _) -> fire (Notify (fromMaybe "That isn't a pairing link" why)) >> redraw'
-    pure $ \perContact perMessage perProfile perGroup perInvite perInviting perMember perStaged -> Handlers
+    pure $ \perContact perMessage perEntry perProfile perGroup perInvite perInviting perMember perStaged perGroupFile perDevice -> Handlers
       { hBack = back'
       , hSend = send
       , hOpenDrawer = openDrawer
@@ -942,9 +1024,12 @@ running actions hub switch restart = do
       , hAddFriend = addFriend
       , hCopyToxId = copyToxId
       , hAttach = attach
-      , hTapMessage = \cid i -> let (tap, _, _) = perMessage Map.! (cid, i) in tap
-      , hHoldMessage = \cid i -> let (_, hold, _) = perMessage Map.! (cid, i) in hold
-      , hCancelFile = \cid i -> let (_, _, cancel) = perMessage Map.! (cid, i) in cancel
+      , hTapMessage = \cid i -> let (tap, _, _, _) = perMessage Map.! (cid, i) in tap
+      , hHoldMessage = \cid i -> let (_, hold, _, _) = perMessage Map.! (cid, i) in hold
+      , hTapEntry = \gid i -> fst (perEntry Map.! (gid, i))
+      , hHoldEntry = \gid i -> snd (perEntry Map.! (gid, i))
+      , hCancelFile = \cid i -> let (_, _, cancel, _) = perMessage Map.! (cid, i) in cancel
+      , hSendAgain = \cid i -> let (_, _, _, again) = perMessage Map.! (cid, i) in again
       , hUnselect = unselect
       , hCopySelected = copySelected
       , hForwardSelected = forwardSelected
@@ -971,7 +1056,7 @@ running actions hub switch restart = do
       , hToggleIpv6 = toggleIpv6
       , hToggleLan = toggleLan
       , hToggleStay = toggleStay
-      , hToggleFormat = (toggleFormats Map.!)
+      , hToggleTyping = toggleTyping
       , hOpenProxy = openProxy
       , hProxyKind = \case
           Nothing               -> let (none, _, _, _) = proxyKinds in none
@@ -988,6 +1073,7 @@ running actions hub switch restart = do
       , hDetails = caDetails . perContact
       , hMuteChat = caMute . perContact
       , hDelete = caDelete . perContact
+      , hHoldChat = caHold . perContact
       , hCopyKey = caCopyKey . perContact
       , hPictures = caPictures . perContact
       , hDraft = draft
@@ -1012,6 +1098,7 @@ running actions hub switch restart = do
       , hMuteGroup = gaMute . perGroup
       , hLeaveGroup = gaLeave . perGroup
       , hDeleteGroup = gaDelete . perGroup
+      , hHoldGroup = gaHold . perGroup
       , hCopyChatId = gaCopyId . perGroup
       , hOpenInvite = \cid gid -> iaOpen (perInvite (cid, gid))
       , hJoin = \cid gid -> iaJoin (perInvite (cid, gid))
@@ -1029,10 +1116,13 @@ running actions hub switch restart = do
       , hInviteFriends = gaInvite . perGroup
       , hInviteFriend = curry perInviting
       , hMember = curry perMember
+      , hGroupFile = \gid fid -> perGroupFile (gid, fid, False)
+      , hPauseGroupFile = \gid fid -> perGroupFile (gid, fid, True)
       , hEndPrivate = endPrivate
       , hGroupSettings = gaSettings . perGroup
       , hPrivacy = gaPrivacy . perGroup
       , hTopicLock = gaTopicLock . perGroup
+      , hGroupPictures = gaPictures . perGroup
       , hVoice = gaVoice . perGroup
       , hRelayBot = gaRelayBot . perGroup
       , hStopRelay = gaStopRelay . perGroup
@@ -1042,6 +1132,11 @@ running actions hub switch restart = do
       , hOpenLink = openLink
       , hLinkEdited = linkEdited
       , hLink = link
+      , hUnlock = unlock
+      , hOpenDevices = openDevices
+      , hPairDevice = pairDevice
+      , hCopyPairing = copyPairing
+      , hRemoveDevice = perDevice
       }
   let redrawn = join (readIORef redraw)
       muting cid = do
@@ -1085,6 +1180,23 @@ running actions hub switch restart = do
                 fire (ClientEvent (Client.MuteGroup gid ((`addUTCTime` from) <$> for))) >> redrawn
               _ -> pure ()
           Nothing -> pure ()
+      -- For a friend's chat or a group.
+      choosingPictures sendIn = withUser $ \u ->
+        let ways = ("As they are", Nothing) : [ ("As " <> formatName f, Just (formatKey f)) | f <- pictureFormats ]
+        in showBottomSheet (userBottomSheetState u) (BottomSheetConfig "Send pictures" (map fst ways)) $ \case
+             BottomSheetItemSelected n | (_, way) : _ <- drop (fromIntegral n) ways -> fire (ClientEvent (sendIn way)) >> redrawn
+             _ -> pure ()
+      leavingGroup gid = do
+        kind <- maybe "group" (kindName . groupKind) . Map.lookup gid . clientGroups . modelClient <$> readMVar model
+        asking ("Leave the " <> kind <> "?") "Its chat stays here. To join again, ask for a new invite."
+          "Leave" (ClientEvent (Client.LeaveGroup gid))
+      deletingGroup gid = asking "Delete the chat?" "Its messages go too, and you leave the group if you're in it."
+        "Delete" (ClientEvent (Client.DeleteGroup gid))
+      -- A chat's menu in the chat list.
+      holding title choices = withUser $ \u ->
+        showBottomSheet (userBottomSheetState u) (BottomSheetConfig title (map fst choices)) $ \case
+          BottomSheetItemSelected n | (_, chosen) : _ <- drop (fromIntegral n) choices -> chosen
+          _ -> pure ()
       asking title message yes event = withUser $ \u ->
         showDialog (userDialogState u) DialogConfig
           { dcTitle = title, dcMessage = message, dcButton1 = yes, dcButton2 = Just "Cancel", dcButton3 = Nothing } $ \case
@@ -1098,12 +1210,8 @@ running actions hub switch restart = do
             <$> createAction (fire (Open (GroupChat gid)))
             <*> createAction (fire (Open (GroupDetails gid)))
             <*> createAction (mutingGroup gid)
-            <*> createAction (do
-                  kind <- maybe "group" (kindName . groupKind) . Map.lookup gid . clientGroups . modelClient <$> readMVar model
-                  asking ("Leave the " <> kind <> "?") "Its chat stays here. To join again, ask for a new invite."
-                    "Leave" (ClientEvent (Client.LeaveGroup gid)))
-            <*> createAction (asking "Delete the chat?" "Its messages go too, and you leave the group if you're in it."
-                                "Delete" (ClientEvent (Client.DeleteGroup gid)))
+            <*> createAction (leavingGroup gid)
+            <*> createAction (deletingGroup gid)
             <*> createAction (copyToClipboard chat)
             <*> createAction (fire (Open (TopicScreen gid)))
             <*> createAction (fire (ClientEvent (Client.ToggleMentions gid)))
@@ -1127,6 +1235,14 @@ running actions hub switch restart = do
                         fire (ClientEvent (Client.ChooseRelayBot gid (Just (memberKey m)))) >> redrawn
                       _ -> pure ())
             <*> createAction (fire (ClientEvent (Client.ChooseRelayBot gid Nothing)))
+            <*> createAction (choosingPictures (Client.SendGroupPictures gid))
+            <*> createAction (do
+                  now <- getCurrentTime
+                  g <- Map.lookup gid . clientGroups . modelClient <$> readMVar model
+                  forM_ g $ \g' -> holding (groupLabel g') $
+                    (if groupMuted now g' then "Unmute notifications" else "Mute notifications", mutingGroup gid)
+                    : [ ("Leave " <> kindName (groupKind g'), leavingGroup gid) | groupPhase g' `elem` [Joining, InGroup] ]
+                    ++ [("Delete chat", deletingGroup gid)])
           modifyIORef' groupsMade (Map.insert gid these)
           pure these
   invitesMade <- newIORef Map.empty
@@ -1139,6 +1255,14 @@ running actions hub switch restart = do
         Nothing -> do
           this <- runActionM actions (createAction (fire (ClientEvent (Client.Unstage cid k))))
           modifyIORef' unstagingMade (Map.insert at this)
+          pure this
+  -- Per file shared in a group, downloading it or pausing that.
+  groupFilesMade <- newIORef Map.empty
+  let groupFileFor at@(gid, fid, pausing) = readIORef groupFilesMade >>= \known -> case Map.lookup at known of
+        Just this -> pure this
+        Nothing -> do
+          this <- runActionM actions (createAction (fire (ClientEvent ((if pausing then Client.PauseGroupFile else Client.DownloadGroupFile) gid fid))))
+          modifyIORef' groupFilesMade (Map.insert at this)
           pure this
   -- Per member, offering what we may do to them now.
   membersMade <- newIORef Map.empty
@@ -1193,12 +1317,13 @@ running actions hub switch restart = do
               <*> createAction (allowing False (\allowed -> do
                     fire (Open (Chat cid))
                     getCurrentTime >>= \now -> fire (StartCall now allowed)))
-              <*> createAction (withUser $ \u ->
-                    let ways = ("As they are", Nothing) : [ ("As " <> formatName f, Just (formatKey f)) | f <- pictureFormats ]
-                    in showBottomSheet (userBottomSheetState u) (BottomSheetConfig "Send pictures" (map fst ways)) $ \case
-                         BottomSheetItemSelected n | (_, way) : _ <- drop (fromIntegral n) ways ->
-                           fire (ClientEvent (Client.SendPictures cid way)) >> redrawn
-                         _ -> pure ())
+              <*> createAction (choosingPictures (Client.SendPictures cid))
+              <*> createAction (do
+                    now <- getCurrentTime
+                    contact <- Map.lookup cid . clientContacts . modelClient <$> readMVar model
+                    forM_ contact $ \c -> holding (contactLabel cid c)
+                      [ (if muted now c then "Unmute notifications" else "Mute notifications", muting cid)
+                      , ("Delete contact", deleting cid) ])
             modifyIORef' made (Map.insert cid these)
             pure these
   -- Per message, once shown. A tap selects while others are selected, or
@@ -1210,12 +1335,13 @@ running actions hub switch restart = do
           Just these -> pure these
           Nothing -> do
             let message current = Map.lookup cid (clientContacts (modelClient current)) >>= find ((== i) . messageId) . contactMessages
-            these <- runActionM actions $ (,,)
+                chat = Client.FriendChat cid
+            these <- runActionM actions $ (,,,)
               <$> createAction (do
                 current <- readMVar model
                 if not (Set.null (modelSelected current)) then fire (Select i)
                 else forM_ (message current) $ \m -> do
-                 forM_ (location (messageText m)) $ \(latitude, longitude) ->
+                 forM_ (location (shownText (messageText m))) $ \(latitude, longitude) ->
                    when (isNothing (messageFile m)) $ openUri (mapsUri latitude longitude)
                  forM_ (messageFile m) $ \file -> case attachmentState file of
                   Complete                      -> openFile (attachmentPath file)
@@ -1227,17 +1353,50 @@ running actions hub switch restart = do
                   let call = isJust (messageCall m)
                       choices =
                         [ ("Open " <> written, openUri uri)
-                        | not call, isNothing (messageFile m), (written, uri) <- take 3 (findLinks (messageText m)) ]
+                        | not call, isNothing (messageFile m), (written, uri) <- take 3 (findLinks (shownText (messageText m))) ]
                         ++ [("Reply", fire (Reply i)) | not call]
-                        ++ [("Forward", fire (Open (Forward cid [i]))) | forwardable m]
-                        ++ [("Copy", copyToClipboard (copiedText (modelClient current) cid [i])) | not call]
-                        ++ [("Select", fire (Select i)), ("Info", fire (Open (MessageInfo cid i)))]
+                        ++ [("Forward", fire (Open (Forward chat [i]))) | forwardable m]
+                        ++ [("Copy", copyToClipboard (copiedText (modelClient current) chat [i])) | not call]
+                        ++ [("Select", fire (Select i)), ("Info", fire (Open (MessageInfo chat i)))]
                   readIORef user >>= mapM_ (\u ->
                     showBottomSheet (userBottomSheetState u) (BottomSheetConfig "Message" (map fst choices)) $ \case
                       BottomSheetItemSelected n | (_, chosen) : _ <- drop (fromIntegral n) choices -> chosen >> redrawn
                       _ -> pure ()))
               <*> createAction (fire (ClientEvent (Client.Cancel cid i)))
+              <*> createAction (fire (ClientEvent (Client.SendAgain cid i)))
             modifyIORef' messageActions (Map.insert ref these)
+            pure these
+  -- Per group message, as for a friend's. Only what members wrote.
+  entryActions <- newIORef Map.empty
+  let entryAction ref@(gid, i) = do
+        known <- readIORef entryActions
+        case Map.lookup ref known of
+          Just these -> pure these
+          Nothing -> do
+            let chat = Client.GroupChat gid
+                entry current = find ((== i) . entryId) . groupEntries =<< Map.lookup gid (clientGroups (modelClient current))
+            these <- runActionM actions $ (,)
+              <$> createAction (do
+                current <- readMVar model
+                unless (Set.null (modelSelected current)) (fire (Select i)))
+              <*> createAction (do
+                current <- readMVar model
+                forM_ (entry current) $ \e -> forM_ (entryText e) $ \text -> do
+                  -- An answer may go to everyone, so not to what was private.
+                  let public = case entryWhat e of
+                        Said {} -> True
+                        _       -> False
+                      choices =
+                        [ ("Open " <> written, openUri uri) | (written, uri) <- take 3 (findLinks text) ]
+                        ++ [ ("Reply", fire (Reply i)) | public ]
+                        ++ [ ("Forward", fire (Open (Forward chat [i])))
+                           , ("Copy", copyToClipboard (copiedText (modelClient current) chat [i]))
+                           , ("Select", fire (Select i)), ("Info", fire (Open (MessageInfo chat i))) ]
+                  readIORef user >>= mapM_ (\u ->
+                    showBottomSheet (userBottomSheetState u) (BottomSheetConfig "Message" (map fst choices)) $ \case
+                      BottomSheetItemSelected n | (_, chosen) : _ <- drop (fromIntegral n) choices -> chosen >> redrawn
+                      _ -> pure ()))
+            modifyIORef' entryActions (Map.insert ref these)
             pure these
   device <- getDeviceInfo
   -- Identicons, made once at the largest size we show.
@@ -1276,6 +1435,23 @@ running actions hub switch restart = do
               b' <- evaluate b
               atomicModifyIORef' decoded ((, ()) . Map.insert path (Just b')) >> join (readIORef redraw)
         pure (join (Map.lookup path known))
+  -- Removing each of the account's devices, after asking.
+  deviceActions <- newIORef Map.empty
+  let deviceActionFor cid = readIORef deviceActions >>= \known -> case Map.lookup cid known of
+        Just this -> pure this
+        Nothing -> do
+          this <- runActionM actions $ createAction $ withUser $ \u ->
+            showDialog (userDialogState u) DialogConfig
+              { dcTitle = "Remove this device?"
+              , dcMessage = "It stops getting this profile's chats. Link it again to have them back."
+              , dcButton1 = "Remove"
+              , dcButton2 = Just "Cancel"
+              , dcButton3 = Nothing
+              } $ \case
+                DialogButton1 -> fire (ClientEvent (Client.RemoveDevice cid)) >> redrawn
+                _ -> pure ()
+          modifyIORef' deviceActions (Map.insert cid this)
+          pure this
   -- Per account: switch to it, delete it, and choose it for a backup.
   profileActions <- newIORef Map.empty
   let profileActionsFor pid = readIORef profileActions >>= \known -> case Map.lookup pid known of
@@ -1301,22 +1477,10 @@ running actions hub switch restart = do
             <*> createAction (fire (ToggleBackup pid))
           modifyIORef' profileActions (Map.insert pid these)
           pure these
-      -- Import a .tox file as a profile, online at once, unless we have it
-      -- already.
       taken path = do
         bytes <- BS.readFile path
         void (try @IOException (removeFile path >> removeDirectory (takeDirectory path)))
-        case importSave bytes of
-          Left Encrypted -> fire (Notify "Profiles saved with a password can't be taken yet") >> redrawn
-          Left NotAProfile -> fire (Notify "That isn't a Tox profile") >> redrawn
-          Right (known, imported) -> do
-            others <- mapM (Store.identity . Store.profileStore database . accountId) =<< Store.profiles database
-            if identitySecretKey known `elem` map identitySecretKey (catMaybes others)
-              then fire (Notify "hTox has that profile already") >> redrawn
-              else switching $ do
-                pid <- Store.newProfile database (Just known) (clientProfile imported)
-                Store.save (Store.profileStore database pid) initialClient imported
-                pure pid
+        taking bytes
       -- Restore the backup's profiles we don't have, online at once.
       restored path = do
         result <- try @SomeException (Store.restore database path)
@@ -1353,7 +1517,8 @@ running actions hub switch restart = do
         , onLifecycle = \case
             -- Also when back from the full screen setting.
             Start -> fullScreenAllowed >>= fire . FullScreenChecked >> fire (Shown True)
-            Stop -> fire (Shown False)
+            -- The system may end hTox without a word from here on.
+            Stop -> fire (Shown False) >> Store.flush database
             _ -> pure ()
         , onNotificationOpened = \key -> forProfile key $ \pid s key' -> case notificationOf key' of
             -- The call screen.
@@ -1390,8 +1555,9 @@ running actions hub switch restart = do
               let shrinkable = chosen == ForPicture && map toLower (takeExtension path) /= ".gif"
                   way = case modelScreen current of
                     Chat cid -> pictureFormat =<< contactPictures =<< Map.lookup cid (clientContacts (modelClient current))
+                    GroupChat gid -> pictureFormat =<< groupPictures =<< Map.lookup gid (clientGroups (modelClient current))
                     _        -> Nothing
-                  attach p name size = fire (Attach p name size fileId) >> redrawn
+                  attach p name size = fire (Attach now p name size fileId) >> redrawn
                   original = attach path (pickedName picked) (fromInteger (pickedSize picked))
                   instead extension write = do
                     let converted = dropExtension path <> extension
@@ -1420,14 +1586,6 @@ running actions hub switch restart = do
         writeIORef redraw (userRequestRedraw state)
         writeIORef permissions (Just (userPermissionState state))
         writeIORef user (Just state)
-        first <- not <$> atomicModifyIORef' (hubFetched hub) (True,)
-        -- Once we have a screen to fetch with.
-        when (first && isNothing (settingProxy settings)) $ performRequest (userHttpState state) (HttpRequest HttpGet nodesUrl [] BS.empty) $ \case
-          Right response | hrStatusCode response == 200, Just nodes <- readNodes (hrRespBody response) -> do
-            BS.writeFile nodesFile (hrRespBody response)
-            writeIORef (hubNodes hub) nodes
-            readMVar (hubSessions hub) >>= mapM_ ((`Network.useNodes` nodes) . sessionNetwork)
-          other -> platformLog ("No nodes fetched: " <> Text.pack (either show (show . hrStatusCode) other))
         current <- readMVar model
         let client = modelClient current
             contactIds = Map.keys (clientContacts client) ++ Map.keys (clientRequests client)
@@ -1436,6 +1594,10 @@ running actions hub switch restart = do
           [ (cid, i) | Chat cid <- [modelScreen current]
                      , contact <- maybe [] pure (Map.lookup cid (clientContacts client))
                      , i <- map messageId (contactMessages contact) ]
+        perEntry <- Map.fromList <$> traverse (\ref -> (,) ref <$> entryAction ref)
+          [ (gid, entryId e) | GroupChat gid <- [modelScreen current]
+                             , g <- maybe [] pure (Map.lookup gid (clientGroups client))
+                             , e <- groupEntries g, isJust (entryText e) ]
         perGroup <- Map.fromList <$> traverse (\gid -> (,) gid <$> groupActionsFor gid) (Map.keys (clientGroups client))
         perInvite <- Map.fromList <$> traverse (\at -> (,) at <$> inviteActionsFor at) (Map.keys (clientInvites client))
         perStaged <- Map.fromList <$> traverse (\at -> (,) at <$> unstagingFor at)
@@ -1444,9 +1606,17 @@ running actions hub switch restart = do
         perMember <- Map.fromList <$> traverse (\at -> (,) at <$> memberFor at)
           [ (gid, n) | GroupDetails gid <- [modelScreen current]
                      , g <- maybe [] pure (Map.lookup gid (clientGroups client)), n <- Map.keys (groupMembers g) ]
+        perGroupFile <- Map.fromList <$> traverse (\at -> (,) at <$> groupFileFor at)
+          [ (gid, groupFileId file, pausing) | GroupChat gid <- [modelScreen current]
+                                             , g <- maybe [] pure (Map.lookup gid (clientGroups client))
+                                             , GroupEntry _ (SharedFile _ file _) _ <- groupEntries g, pausing <- [False, True] ]
         perInviting <- Map.fromList <$> traverse (\at -> (,) at <$> invitingFor at)
           [ (gid, cid) | InviteFriendsScreen gid <- [modelScreen current]
                        , (cid, c) <- Map.toList (clientContacts client), contactOnline c ]
+        perDevice <- Map.fromList <$> traverse (\cid -> (,) cid <$> deviceActionFor cid)
+          [ ContactId (Text.toUpper (Text.decodeUtf8 (Base16.encode pk)))
+          | DevicesScreen <- [modelScreen current], Just home <- [clientHome client]
+          , Sync.PublicKey pk <- Map.keys (Home.devices home) ]
         -- The other profiles, for the drawer. A linked one has no name until
         -- its account's events say it.
         summaries <- readIORef (hubSummaries hub)
@@ -1472,7 +1642,9 @@ running actions hub switch restart = do
                               , Just png <- [(`Map.lookup` clientAvatars client) =<< contactAvatar c] ]
               ++ [ (summaryKey summary, png) | (_, summary) <- others, Just png <- [summaryAvatar summary] ]
             keys = Map.union pictures identicons
-        code <- qrOf (profileToxId (clientProfile client))
+        -- The pairing link where it's shown, otherwise the Tox ID.
+        code <- qrOf (maybe (profileToxId (clientProfile client)) (Text.drop (Text.length "tox:"))
+                        (pairingLink current <* guard (modelScreen current == DevicesScreen)))
         sizes <- traverse sizeOf $ Map.fromList $
           [ (attachmentPath a, attachmentPath a)
           | Chat cid <- [modelScreen current], c <- maybe [] pure (Map.lookup cid (clientContacts client))
@@ -1481,6 +1653,10 @@ running actions hub switch restart = do
           -- And staged ones.
           ++ [ (path, path) | Chat cid <- [modelScreen current]
                             , StagedFile path _ _ _ <- Map.findWithDefault [] cid (clientStaged client) ]
+          -- And files shared in the group, once they're here.
+          ++ [ (attachmentPath a, attachmentPath a)
+             | GroupChat gid <- [modelScreen current], g <- maybe [] pure (Map.lookup gid (clientGroups client))
+             , GroupEntry _ (SharedFile _ file _) _ <- groupEntries g, Just a <- [groupFileData file], attachmentState a == Complete ]
         bitmaps <- Map.traverseWithKey (\path _ -> decodedOf path) (Map.filterWithKey (\path _ -> isQoi path) sizes)
         dark <- isDarkMode
         clock24 <- is24HourClock
@@ -1499,9 +1675,11 @@ running actions hub switch restart = do
               , envClock24 = clock24
               , envElsewhere = elsewhere
               , envOthers = others
+              , envSchema = Store.schemaVersion
+              , envGraphics = diGraphics device
               , envPictureSize = \path -> Map.findWithDefault Nothing path sizes
               , envDecoded = \path -> join (Map.lookup path bitmaps)
               }
         perProfile <- Map.fromList <$> traverse (\a -> (,) (accountId a) <$> profileActionsFor (accountId a)) (modelProfiles current)
-        pure $ view env (handlers (perContact Map.!) perMessage (perProfile Map.!) (perGroup Map.!) (perInvite Map.!) (perInviting Map.!) (perMember Map.!) (perStaged Map.!)) current
+        pure $ view env (handlers (perContact Map.!) perMessage perEntry (perProfile Map.!) (perGroup Map.!) (perInvite Map.!) (perInviting Map.!) (perMember Map.!) (perStaged Map.!) (perGroupFile Map.!) (perDevice Map.!)) current
     }, stop)

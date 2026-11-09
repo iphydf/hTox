@@ -1,6 +1,8 @@
-{-# LANGUAGE LambdaCase        #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TypeOperators     #-}
+{-# LANGUAGE LambdaCase          #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StrictData          #-}
+{-# LANGUAGE TypeOperators       #-}
 -- | SQLite database: per account its keys, profile, friends, requests and
 -- chats, plus the device settings. We load the model at the start, and
 -- write back what each event changes.
@@ -9,6 +11,7 @@ module HTox.Store
   , Store
   , open
   , opened
+  , schemaVersion
   , Newer (..)
   , Locked (..)
   , profiles
@@ -18,28 +21,39 @@ module HTox.Store
   , newLinkedProfile
   , deleteProfile
   , backUp
+  , writing
+  , written
+  , flush
   , restore
   , profileStore
   , identity
   , saveIdentity
   , load
   , older
+  , recalled
   , save
   ) where
 
 import           Control.Applicative       ((<|>))
 import           Control.Concurrent.MVar   (MVar, newMVar, withMVar)
+import           Control.Concurrent.STM    (TVar, atomically, check,
+                                            modifyTVar', newTVarIO, readTVar,
+                                            readTVarIO)
 import           Control.Exception         (Exception (..), IOException,
                                             finally, throwIO, try)
-import           Control.Monad             (forM, forM_, unless, void, when)
+import           Control.Monad             (filterM, forM, forM_, unless, void,
+                                            when)
 import qualified Crypto.Saltine.Class      as Sodium
 import           Crypto.Saltine.Core.Utils (randomByteString)
 import qualified Data.ByteString           as BS
 import qualified Data.ByteString.Base16    as Base16
 import           Data.Int                  (Int64)
+import           Data.Map.Strict           (Map)
 import qualified Data.Map.Strict           as Map
 import           Data.Maybe                (catMaybes, fromMaybe, isJust,
-                                            mapMaybe)
+                                            listToMaybe, mapMaybe)
+import           Data.Sequence             (Seq)
+import qualified Data.Sequence             as Seq
 import qualified Data.Set                  as Set
 import           Data.Text                 (Text)
 import qualified Data.Text                 as Text
@@ -47,7 +61,7 @@ import qualified Data.Text.Encoding        as Text
 import           Data.Time                 (NominalDiffTime, UTCTime)
 import           Data.Time.Clock.POSIX     (posixSecondsToUTCTime,
                                             utcTimeToPOSIXSeconds)
-import           Data.Word                 (Word16, Word32, Word64)
+import           Data.Word                 (Word32, Word64)
 import           Database.SQLite.Simple    (Only (..), execute, execute_, query,
                                             query_, withTransaction, (:.) (..))
 import qualified Database.SQLite.Simple    as SQLite
@@ -57,22 +71,63 @@ import           System.IO                 (IOMode (ReadMode), withBinaryFile)
 import qualified Tox.Application.Tox       as Tox
 import           Tox.Client                (initialClient)
 import           Tox.Client.Changes
+import qualified Tox.Client.Home           as Home
 import qualified Tox.Client.Linked         as Linked
 import           Tox.Client.Types          (Ids (..), MessageId (..))
 import qualified Tox.Client.Update         as Client
 import qualified Tox.Crypto.Core.KeyPair   as KeyPair
+import qualified Tox.Share.Info            as Info
 import qualified Tox.Sync.Id               as Sync
 import qualified Tox.Sync.Store            as Sync
 
 import           HTox.Model
+import           HTox.Private              (private)
 
--- | One thread at a time (each online profile saves from its own).
-data Database = Database (MVar ()) SQLite.Connection
+data Database = Database
+  { dbLock       :: MVar ()
+    -- ^ One thread at a time (each online profile saves from its own).
+  , dbQueued     :: TVar (Seq (Int64, [Change]))
+    -- ^ Saved, by profile, but not yet written.
+  , dbConnection :: SQLite.Connection
+  }
 
 data Store = Store Database ProfileId
 
+-- | After what was saved is written, so all of it is there.
 using :: Database -> (SQLite.Connection -> IO a) -> IO a
-using (Database lock db) f = withMVar lock (const (f db))
+using database f = withMVar (dbLock database) $ \() -> writeQueued database >> f (dbConnection database)
+
+-- | In one transaction. Kept queued if it fails, to try again.
+writeQueued :: Database -> IO ()
+writeQueued database = do
+  queued <- readTVarIO (dbQueued database)
+  unless (Seq.null queued) $ do
+    let db = dbConnection database
+    withTransaction db $ forM_ queued $ \(i, todo) -> mapM_ (apply db i) todo
+    atomically $ modifyTVar' (dbQueued database) (Seq.drop (Seq.length queued))
+
+-- | Writes what is saved as it comes, so no event waits for the disk, each
+-- write timed by the second. Says why a write failed, and tries again once
+-- more is saved.
+writing :: (Text -> IO ()) -> (IO () -> IO ()) -> Database -> IO ()
+writing complain timed database = go 0
+  where
+    go stuck = do
+      atomically $ readTVar (dbQueued database) >>= check . (> stuck) . Seq.length
+      try (timed (flush database)) >>= \case
+        Right ()                      -> go 0
+        Left (err :: SQLite.SQLError) -> do
+          complain ("Not saved yet: " <> Text.pack (displayException err))
+          go . Seq.length =<< readTVarIO (dbQueued database)
+
+-- | Once all that was saved is written. Tox is told nothing before what it
+-- would do is saved.
+written :: Database -> IO ()
+written database = atomically $ readTVar (dbQueued database) >>= check . Seq.null
+
+-- | Writes what was saved now, as the app goes away.
+flush :: Database -> IO ()
+flush database = using database (const (pure ()))
 
 newtype Newer = Newer Int
   deriving (Show)
@@ -91,13 +146,22 @@ instance Exception Locked where
 -- | Encrypted with the key if there is one. An old plain database gets
 -- encrypted first.
 open :: Maybe BS.ByteString -> FilePath -> IO Database
-open Nothing path = SQLite.open path >>= opened
+open Nothing path = SQLite.open path >>= quickCommits >>= opened
 open (Just key) path = do
   plain <- isPlain path
   when plain $ encrypt key path
   db <- SQLite.open path
   unlock db key
-  opened db
+  quickCommits db >>= opened
+
+-- | Commits append to a log without waiting for the disk, as we save after
+-- every event that changes something. A crash loses nothing, a power cut may
+-- lose the latest, but never the database.
+quickCommits :: SQLite.Connection -> IO SQLite.Connection
+quickCommits db = do
+  void (query_ db "PRAGMA journal_mode = WAL" :: IO [Only Text])
+  execute_ db "PRAGMA synchronous = NORMAL"
+  pure db
 
 isPlain :: FilePath -> IO Bool
 isPlain path = do
@@ -106,7 +170,7 @@ isPlain path = do
     then (== "SQLite format 3\0") <$> withBinaryFile path ReadMode (`BS.hGet` 16)
     else pure False
 
--- | Also reads something, which fails with the wrong key.
+-- | Sets the key, then reads something, which fails if the key is wrong.
 unlock :: SQLite.Connection -> BS.ByteString -> IO ()
 unlock db key = do
   execute_ db (SQLite.Query ("PRAGMA key = \"" <> rawKey key <> "\""))
@@ -116,7 +180,7 @@ unlock db key = do
 rawKey :: BS.ByteString -> Text
 rawKey key = "x'" <> Text.decodeUtf8 (Base16.encode key) <> "'"
 
--- | Into a new file, which then replaces the plain one.
+-- | Encrypts into a new file, which then replaces the plain one.
 encrypt :: BS.ByteString -> FilePath -> IO ()
 encrypt key path = do
   let encrypted = path <> ".encrypting"
@@ -130,6 +194,10 @@ encrypt key path = do
   SQLite.close plain
   renameFile encrypted path
 
+-- | What 'opened' takes every database to.
+schemaVersion :: Int
+schemaVersion = length migrations
+
 opened :: SQLite.Connection -> IO Database
 opened db = do
   [Only version] <- query_ db "PRAGMA user_version"
@@ -137,7 +205,7 @@ opened db = do
   forM_ (zip [1 ..] (drop version migrations)) $ \(done, steps) -> withTransaction db $ do
     mapM_ (execute_ db) steps
     execute_ db (SQLite.Query ("PRAGMA user_version = " <> Text.pack (show (version + done :: Int))))
-  flip Database db <$> newMVar ()
+  Database <$> newMVar () <*> newTVarIO Seq.empty <*> pure db
 
 -- | Each step takes the database to the next version, the first from
 -- nothing.
@@ -219,7 +287,37 @@ migrations =
     , "UPDATE profiles SET id_seed = randomblob(32)"
     , "ALTER TABLE profiles ADD COLUMN ids_used INTEGER NOT NULL DEFAULT 0"
     ]
+  , [ -- Tox message IDs for group history sync, and files shared in groups.
+      "ALTER TABLE group_entries ADD COLUMN tox_id INTEGER"
+    , "ALTER TABLE group_entries ADD COLUMN file_id BLOB"
+    , "ALTER TABLE group_entries ADD COLUMN file_info BLOB"
+    , "ALTER TABLE group_entries ADD COLUMN file_size INTEGER"
+    , "ALTER TABLE group_entries ADD COLUMN file_path TEXT"
+    , "ALTER TABLE group_entries ADD COLUMN file_done INTEGER"
+    , "ALTER TABLE group_entries ADD COLUMN file_state TEXT"
+    ]
+  , [ -- Settings as rows by name, so a new one needs no new column: one
+      -- without a row has its default.
+      "CREATE TABLE account_settings\
+      \ (profile INTEGER NOT NULL REFERENCES profiles (id), name TEXT NOT NULL, value NOT NULL,\
+      \ PRIMARY KEY (profile, name))"
+    , "INSERT INTO account_settings SELECT id, 'auto_accept', auto_accept FROM profiles"
+    , "ALTER TABLE profiles DROP COLUMN auto_accept"
+    , "ALTER TABLE profiles DROP COLUMN formats_off"
+    -- What's left is the active profile.
+    , "ALTER TABLE device_settings RENAME TO device"
+    , "CREATE TABLE device_settings (name TEXT PRIMARY KEY, value NOT NULL)"
+    ]
+    ++ [ "INSERT INTO device_settings SELECT '" <> column <> "', " <> column <> " FROM device WHERE "
+         <> column <> " IS NOT NULL"
+       | column <- deviceColumns ]
+    ++ [ "ALTER TABLE device DROP COLUMN " <> column | column <- deviceColumns ]
+  , [ -- The picture format sent in each group.
+      "ALTER TABLE groups ADD COLUMN pictures TEXT"
+    ]
   ]
+  where
+    deviceColumns = ["udp", "ipv6", "lan", "stay_online", "proxy_type", "proxy_host", "proxy_port"]
 
 -- | Oldest first.
 profiles :: Database -> IO [Account]
@@ -235,7 +333,7 @@ accounts db = map account <$> query_ db "SELECT id, nickname, secret_key FROM pr
 -- | Last one chosen, or the first, or a new one.
 activeProfile :: Database -> IO ProfileId
 activeProfile database = do
-  chosen <- using database $ \db -> query_ db "SELECT active_profile FROM device_settings WHERE active_profile IN (SELECT id FROM profiles)"
+  chosen <- using database $ \db -> query_ db "SELECT active_profile FROM device WHERE active_profile IN (SELECT id FROM profiles)"
   case chosen of
     [Only (Just i)] -> pure (ProfileId i)
     _ -> profiles database >>= \case
@@ -243,15 +341,14 @@ activeProfile database = do
       [] -> newProfile database Nothing (clientProfile initialClient) >>= \new -> new <$ setActive database new
 
 setActive :: Database -> ProfileId -> IO ()
-setActive database (ProfileId i) = using database $ \db -> execute db "UPDATE device_settings SET active_profile = ?" (Only i)
+setActive database (ProfileId i) = using database $ \db -> execute db "UPDATE device SET active_profile = ?" (Only i)
 
 -- | With its keys if it came from elsewhere.
 newProfile :: Database -> Maybe Identity -> Profile -> IO ProfileId
 newProfile database known profile = using database $ \db -> do
-  execute db "INSERT INTO profiles (secret_key, nospam, nickname, status, auto_accept, id_seed)\
-             \ VALUES (?, ?, ?, ?, ?, randomblob(32))"
-    ( identitySecretKey <$> known, identityNospam <$> known, profileNickname profile, profileStatus profile
-    , settingAutoAccept (clientAccount initialClient) )
+  execute db "INSERT INTO profiles (secret_key, nospam, nickname, status, id_seed)\
+             \ VALUES (?, ?, ?, ?, randomblob(32))"
+    (identitySecretKey <$> known, identityNospam <$> known, profileNickname profile, profileStatus profile)
   ProfileId <$> SQLite.lastInsertRowId db
 
 -- | Linked to an account on another device (its home), by the home's Tox
@@ -261,9 +358,9 @@ newLinkedProfile :: Database -> Text -> Text -> UTCTime -> IO ProfileId
 newLinkedProfile database home pairing now = using database $ \db -> do
   pair <- KeyPair.newKeyPair
   nospam <- BS.foldl' (\n x -> n * 256 + fromIntegral x) (0 :: Word32) <$> randomByteString 4
-  execute db "INSERT INTO profiles (secret_key, nospam, nickname, status, auto_accept, home, pairing, linked_at, id_seed)\
-             \ VALUES (?, ?, ?, ?, ?, ?, ?, ?, randomblob(32))"
-    ( (Sodium.encode (KeyPair.secretKey pair), nospam, "" :: Text, "" :: Text, settingAutoAccept (clientAccount initialClient))
+  execute db "INSERT INTO profiles (secret_key, nospam, nickname, status, home, pairing, linked_at, id_seed)\
+             \ VALUES (?, ?, ?, ?, ?, ?, ?, randomblob(32))"
+    ( (Sodium.encode (KeyPair.secretKey pair), nospam, "" :: Text, "" :: Text)
     :. (home, pairing, toMillis now) )
   ProfileId <$> SQLite.lastInsertRowId db
 
@@ -274,7 +371,7 @@ deleteProfile database (ProfileId i) = using database $ \db -> withTransaction d
   forM_ paths $ \(Only path) -> void (try (removeFile path) :: IO (Either IOException ()))
   forM_ ("staged" : owned) $ \table ->
     execute db (SQLite.Query ("DELETE FROM " <> table <> " WHERE profile = ?")) (Only i)
-  execute db "UPDATE device_settings SET active_profile = NULL WHERE active_profile = ?" (Only i)
+  execute db "UPDATE device SET active_profile = NULL WHERE active_profile = ?" (Only i)
   execute db "DELETE FROM profiles WHERE id = ?" (Only i)
 
 -- | Tables with rows of each profile, besides staged files (a backup has no
@@ -282,16 +379,17 @@ deleteProfile database (ProfileId i) = using database $ \db -> withTransaction d
 owned :: [Text]
 owned =
   [ "contacts", "messages", "requests", "declined", "drafts", "avatars", "groups", "group_entries", "relay_bots"
-  , "invites", "sync_events" ]
+  , "invites", "sync_events", "account_settings" ]
 
 -- | Copies the profiles into a new plain database, to restore here or on
 -- another phone. Device settings stay here.
 backUp :: Database -> [ProfileId] -> FilePath -> IO ()
 backUp database pids path = do
-  void (try (removeFile path) :: IO (Either IOException ()))
+  private path
   SQLite.withConnection path $ \backup -> do
     void (opened backup)
     execute_ backup "DELETE FROM device_settings"
+    execute_ backup "UPDATE device SET active_profile = NULL"
   attached database path $ \db -> forM_ pids $ \(ProfileId i) -> do
     execute db "INSERT INTO backup.profiles SELECT * FROM main.profiles WHERE id = ?" (Only i)
     forM_ owned $ \table ->
@@ -350,12 +448,28 @@ saveIdentity :: Store -> Identity -> IO ()
 saveIdentity (Store database (ProfileId i)) (Identity key nospam) = using database $ \db ->
   execute db "UPDATE profiles SET secret_key = ?, nospam = ? WHERE id = ?" (key, nospam, i)
 
--- | Or the initial model if nothing was saved.
+-- | History a member sent, without what we have already and with the names
+-- the group's chat had for its senders, as the chat in memory may not reach
+-- back as far.
+recalled :: Store -> Client.Event -> IO Client.Event
+recalled (Store database (ProfileId i)) = \case
+  Client.GroupRecalled gid@(GroupId c) now n names entries -> using database $ \db -> do
+    fresh <- filterM (\(_, who, mid, _) -> null <$> (SQLite.query db
+      "SELECT 1 FROM group_entries WHERE profile = ? AND chat_id = ? AND member_key IS ? AND tox_id = ? LIMIT 1"
+      (i, c, who, fromIntegral mid :: Int64) :: IO [Only Int])) entries
+    stored <- forM (Set.toList (Set.fromList [key | (_, Just key, _, _) <- fresh])) $ \key -> fmap ((,) key . fromOnly) . listToMaybe <$> SQLite.query db
+      "SELECT member_name FROM group_entries WHERE profile = ? AND chat_id = ? AND member_key = ? AND member_name != ''\
+      \ ORDER BY place DESC LIMIT 1" (i, c, key)
+    pure (Client.GroupRecalled gid now n (names <> Map.fromList (catMaybes stored)) fresh)
+  event -> pure event
+
+-- | The saved model, or the initial one if nothing was saved.
 load :: Store -> IO Model
 load (Store database pid@(ProfileId i)) = using database $ \db -> do
   let ofProfile q = SQLite.query db q (Only i)
-  rows <- ofProfile "SELECT nickname, status, away, avatar, auto_accept, formats_off FROM profiles WHERE id = ?"
-    :: IO [(Text, Text, Int, Maybe BS.ByteString, Word64, Text)]
+  rows <- ofProfile "SELECT nickname, status, away, avatar FROM profiles WHERE id = ?"
+    :: IO [(Text, Text, Int, Maybe BS.ByteString)]
+  accountValues <- Map.fromList <$> ofProfile "SELECT name, value FROM account_settings WHERE profile = ?"
   ids <- ofProfile "SELECT id_seed, ids_used FROM profiles WHERE id = ?" :: IO [(Maybe BS.ByteString, Word64)]
   avatars <- ofProfile "SELECT hash, png FROM avatars WHERE profile = ?" :: IO [(BS.ByteString, BS.ByteString)]
   contacts <- ofProfile
@@ -369,9 +483,9 @@ load (Store database pid@(ProfileId i)) = using database $ \db -> do
   declined <- ofProfile "SELECT key, message FROM declined WHERE profile = ?" :: IO [(Text, Text)]
   drafts <- ofProfile "SELECT key, message FROM drafts WHERE profile = ?" :: IO [(Text, Text)]
   groups <- ofProfile
-    "SELECT chat_id, name, phase, unread, saved, muted, muted_until, draft, mentions, topic, kind\
+    "SELECT chat_id, name, phase, unread, saved, muted, muted_until, draft, mentions, topic, kind, pictures\
     \ FROM groups WHERE profile = ?"
-    :: IO [(Text, Text, Text, Int, Maybe BS.ByteString) :. (Bool, Maybe Integer, Maybe Text, Bool, Text) :. Only Text]
+    :: IO [(Text, Text, Text, Int, Maybe BS.ByteString) :. (Bool, Maybe Integer, Maybe Text, Bool, Text) :. (Text, Maybe Text)]
   entries <- SQLite.query db (entryWindow <> "SELECT " <> entryColumns <> " FROM group_entries JOIN starts ON chat_id = chat\
     \ WHERE profile = ? AND place >= start ORDER BY chat_id, place") (chatPage, i, i)
   earlierEntries <- SQLite.query db (entryWindow <> "SELECT chat FROM starts WHERE lowest < start") (chatPage, i)
@@ -385,8 +499,7 @@ load (Store database pid@(ProfileId i)) = using database $ \db -> do
   linking <- ofProfile "SELECT home, pairing, linked_at, secret_key FROM profiles WHERE id = ?"
     :: IO [(Maybe Text, Maybe Text, Maybe Integer, Maybe BS.ByteString)]
   events <- ofProfile "SELECT bytes FROM sync_events WHERE profile = ? ORDER BY rank" :: IO [Only BS.ByteString]
-  devices <- query_ db "SELECT udp, ipv6, lan, stay_online, proxy_type, proxy_host, proxy_port FROM device_settings"
-    :: IO [(Bool, Bool, Bool, Bool, Maybe Text, Maybe Text, Maybe Word16)]
+  deviceValues <- Map.fromList <$> query_ db "SELECT name, value FROM device_settings"
   let chats = Map.fromListWith (flip (++)) [(cid, [m]) | (cid, m) <- map messageOf messages]
       earlier = Set.fromList . map fromOnly
       kept =
@@ -399,15 +512,15 @@ load (Store database pid@(ProfileId i)) = using database $ \db -> do
         , let cid = ContactId key ]
       said = Map.fromListWith (flip (++)) [(gid, [e]) | Just (gid, e) <- map entryOf entries]
       profile = case rows of
-        (nickname, status, away, _, _, _) : _ -> (clientProfile initialClient)
+        (nickname, status, away, _) : _ -> (clientProfile initialClient)
           { profileNickname = nickname, profileStatus = status, profileAway = awayOf away }
         [] -> clientProfile initialClient
       client = initialClient
         { clientProfile = profile
         , clientProfileId = pid
         , clientAvatar = case rows of
-            (_, _, _, avatar, _, _) : _ -> avatar
-            []                          -> Nothing
+            (_, _, _, avatar) : _ -> avatar
+            []                    -> Nothing
         , clientAvatars = Map.fromList avatars
         , clientIds = case ids of
             (seed, used) : _ -> Ids (fromMaybe BS.empty seed) used
@@ -427,29 +540,29 @@ load (Store database pid@(ProfileId i)) = using database $ \db -> do
               , (newGroup name (kindOf kind) (phaseOf phase))
                   { groupEntries = Map.findWithDefault [] gid said, groupUnread = unread, groupSaved = saved
                   , groupMute = if mute then Just (maybe MutedAlways (MutedUntil . fromMillis) until') else Nothing
-                  , groupMentions = mentioned, groupTopic = topic, groupRelayBot = lookup chat bots
+                  , groupMentions = mentioned, groupPictures = pictures, groupTopic = topic, groupRelayBot = lookup chat bots
                   , groupEarlier = Set.member chat (earlier earlierEntries) } )
-            | (chat, name, phase, unread, saved) :. (mute, until', _, mentioned, topic) :. Only kind <- groups
+            | (chat, name, phase, unread, saved) :. (mute, until', _, mentioned, topic) :. (kind, pictures) <- groups
             , let gid = GroupId chat ]
         , clientGroupDrafts = Map.fromList [(GroupId chat, d) | (chat, _, _, _, _) :. (_, _, Just d, _, _) :. _ <- groups]
         , clientInvites = Map.fromList
             [ ( (ContactId friend, GroupId chat)
               , Invite (kindOf kind) name bytes (if answered then Just (fromMaybe "" password) else Nothing) )
             | (friend, chat, name, bytes, answered, password, kind) <- invites ]
-        , clientAccount = case rows of
-            (_, _, _, _, size, off) : _ -> AccountSettings size (Set.fromList (Text.words off))
-            []                     -> clientAccount initialClient
-        , clientDevice = case devices of
-            (udp, ipv6, lan, stay, kind, host, port) : _ ->
-              DeviceSettings udp ipv6 lan stay (Tox.Proxy <$> (proxyKind =<< kind) <*> (Text.unpack <$> host) <*> port)
-            [] -> clientDevice initialClient
+        , clientAccount = accountSettings accountValues
+        , clientDevice = deviceSettings deviceValues
         , clientLinked = case linking of
             [(Just home, pairing, Just since, Just secret)] | Just sk <- Sodium.decode secret ->
-              let device = Sync.PublicKey (Sodium.encode (KeyPair.publicKey (KeyPair.fromSecretKey sk)))
-                  held = foldl (\store bytes -> either (const store) snd (Sync.insert bytes store)) Sync.emptyStore [b | Only b <- events]
-              in Just (Linked.newLinked home pairing (fromMillis since) device held)
+              Just (Linked.newLinked home pairing (fromMillis since) (publicOf sk) held)
+            _ -> Nothing
+        -- Our own account with events has devices.
+        , clientHome = case linking of
+            [(Nothing, _, _, Just secret)] | not (null events), Just sk <- Sodium.decode secret ->
+              Just (Home.newHome (publicOf sk) held)
             _ -> Nothing
         }
+      publicOf sk = Sync.PublicKey (Sodium.encode (KeyPair.publicKey (KeyPair.fromSecretKey sk)))
+      held = foldl (\store bytes -> either (const store) snd (Sync.insert bytes store)) Sync.emptyStore [b | Only b <- events]
   pure initial
     { modelClient = client
     , modelProfiles = others
@@ -508,15 +621,19 @@ messageOf ((key, mine, text, time, delivery) :. (size, path, done, state) :. (vi
     call = CallRecord <$> video <*> Just (fromMillis' <$> talked) <*> missed
 
 type EntryRow = (Text, Integer, Text, Maybe Text, Maybe Text) :. (Int, Maybe Text, Maybe Text, Maybe Text, Maybe Text) :. Only BS.ByteString
+  :. (Maybe Int64, Maybe BS.ByteString, Maybe BS.ByteString, Maybe Word64) :. (Maybe FilePath, Maybe Word64, Maybe Text)
 
 entryColumns :: SQLite.Query
-entryColumns = "chat_id, time, what, member_key, member_name, kind, text, delivery, other_key, other_name, id"
+entryColumns = "chat_id, time, what, member_key, member_name, kind, text, delivery, other_key, other_name, id,\
+  \ tox_id, file_id, file_info, file_size, file_path, file_done, file_state"
 
 -- | Nothing for what this version doesn't know.
 entryOf :: EntryRow -> Maybe (GroupId, GroupEntry)
-entryOf ((chat, time, what, key, name) :. (kind, text, delivery, otherKey, otherName) :. Only eid) =
+entryOf ((chat, time, what, key, name) :. (kind, text, delivery, otherKey, otherName) :. Only eid
+         :. (messageNumber, fileId, fileInfo, size) :. (path, done, state)) =
   (\happening -> (GroupId chat, GroupEntry (fromMillis time) happening (MessageId eid))) <$> case what of
-    "said"         -> Just (Said member kind' (fromMaybe "" text) (maybe Delivered delivery' delivery))
+    "said"         -> Just (Said member kind' (fromMaybe "" text) (maybe Delivered delivery' delivery) toxId')
+    "shared file"  -> (\fid -> SharedFile member (GroupFile fid (Info.decode =<< fileInfo) file 0) toxId') <$> fileId
     "private from" -> (\m -> PrivateFrom m kind' (fromMaybe "" text)) <$> member
     "private to"   -> (\m -> PrivateTo m kind' (fromMaybe "" text) (maybe Delivered delivery' delivery)) <$> member
     "moderated"    -> Moderated member other <$> (moderationOf =<< text)
@@ -529,10 +646,16 @@ entryOf ((chat, time, what, key, name) :. (kind, text, delivery, otherKey, other
     member = Member <$> key <*> name
     other = Member <$> otherKey <*> otherName
     kind' = if kind == 1 then Tox.MessageAction else Tox.MessageNormal
+    toxId' = fromIntegral <$> messageNumber
+    -- A download a restart cut off is interrupted.
+    file = (\s p d st -> Attachment s p d (cutOff (fileState' st)) fileId) <$> size <*> path <*> done <*> state
+    cutOff st = if st == Moving then Interrupted else st
 
+-- | Queued, for 'writing' to write, or whatever uses the database next.
 save :: Store -> Client -> Client -> IO ()
-save (Store database (ProfileId i)) old new = using database $ \db -> withTransaction db $
-  mapM_ (apply db i) (changes old new)
+save (Store database (ProfileId i)) old new =
+  unless (null todo) . atomically $ modifyTVar' (dbQueued database) (Seq.|> (i, todo))
+  where todo = changes old new
 
 apply :: SQLite.Connection -> Int64 -> Change -> IO ()
 apply db i = \case
@@ -540,14 +663,11 @@ apply db i = \case
     execute db "UPDATE profiles SET nickname = ?, status = ?, away = ?, avatar = ? WHERE id = ?"
       (profileNickname profile, profileStatus profile, fromEnum (profileAway profile), avatar, i)
   IdsUsed used -> execute db "UPDATE profiles SET ids_used = ? WHERE id = ?" (used, i)
-  AccountChanged account ->
-    execute db "UPDATE profiles SET auto_accept = ?, formats_off = ? WHERE id = ?"
-      (settingAutoAccept account, Text.unwords (Set.toList (settingFormatsOff account)), i)
-  DeviceChanged (DeviceSettings udp ipv6 lan stay proxy) ->
-    execute db "UPDATE device_settings SET udp = ?, ipv6 = ?, lan = ?, stay_online = ?,\
-               \ proxy_type = ?, proxy_host = ?, proxy_port = ?"
-      ( (udp, ipv6, lan, stay)
-      :. ( proxyKindName . Tox.proxyType <$> proxy, Tox.proxyHost <$> proxy, Tox.proxyPort <$> proxy ) )
+  AccountChanged account -> forM_ (accountRows account) $ \(name, value) ->
+    execute db "INSERT OR REPLACE INTO account_settings (profile, name, value) VALUES (?, ?, ?)" (i, name, value)
+  DeviceChanged device -> forM_ (deviceRows device) $ \case
+    (name, Just value) -> execute db "INSERT OR REPLACE INTO device_settings (name, value) VALUES (?, ?)" (name, value)
+    (name, Nothing)    -> execute db "DELETE FROM device_settings WHERE name = ?" (Only name)
   AvatarAdded hash png -> execute db "INSERT OR REPLACE INTO avatars (profile, hash, png) VALUES (?, ?, ?)" (i, hash, png)
   AvatarDropped hash -> execute db "DELETE FROM avatars WHERE profile = ? AND hash = ?" (i, hash)
   ContactChanged (ContactId key) wanted contact ->
@@ -591,10 +711,10 @@ apply db i = \case
   GroupChanged (GroupId chat) g draft -> do
     execute db
       "INSERT OR REPLACE INTO groups (profile, chat_id, name, phase, unread, saved, muted, muted_until, draft,\
-      \ mentions, topic, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      \ mentions, topic, kind, pictures) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
       ( (i, chat, groupName g, phaseName (groupPhase g), groupUnread g)
       :. (groupSaved g, isJust (groupMute g), mutedUntil (groupMute g), draft, groupMentions g, groupTopic g)
-      :. Only (kindName (groupKind g)) )
+      :. (kindName (groupKind g), groupPictures g) )
     case groupRelayBot g of
       Just bot -> execute db "INSERT OR REPLACE INTO relay_bots (profile, chat_id, bot) VALUES (?, ?, ?)" (i, chat, bot)
       Nothing  -> execute db "DELETE FROM relay_bots WHERE profile = ? AND chat_id = ?" (i, chat)
@@ -604,7 +724,8 @@ apply db i = \case
     execute db "DELETE FROM groups WHERE profile = ? AND chat_id = ?" (i, chat)
   EntryChanged (GroupId chat) (GroupEntry time happening eid) -> do
     let (what, member, kind, text, delivery, other) = case happening of
-          Said who k t d       -> ("said" :: Text, who, k, Just t, Just (deliveryName d), Nothing)
+          Said who k t d _     -> ("said" :: Text, who, k, Just t, Just (deliveryName d), Nothing)
+          SharedFile who _ _   -> ("shared file", who, Tox.MessageNormal, Nothing, Nothing, Nothing)
           PrivateFrom who k t  -> ("private from", Just who, k, Just t, Nothing, Nothing)
           PrivateTo who k t d  -> ("private to", Just who, k, Just t, Just (deliveryName d), Nothing)
           Moderated by whom m  -> ("moderated", by, Tox.MessageNormal, Just (moderationName m), Nothing, whom)
@@ -612,18 +733,28 @@ apply db i = \case
           Departed who         -> ("departed", Just who, Tox.MessageNormal, Nothing, Nothing, Nothing)
           TopicSet who t       -> ("topic", who, Tox.MessageNormal, Just t, Nothing, Nothing)
           Noted t              -> ("noted", Nothing, Tox.MessageNormal, Just t, Nothing, Nothing)
+        (messageNumber, shared) = case happening of
+          Said _ _ _ _ mid      -> (mid, Nothing)
+          SharedFile _ file mid -> (mid, Just file)
+          _                     -> (Nothing, Nothing)
+        attachment = groupFileData =<< shared
+    place <- entryPlace db i chat time eid
     execute db
       "INSERT INTO group_entries (profile, chat_id, place, time, what, member_key, member_name,\
-      \ kind, text, delivery, other_key, other_name, id) VALUES (?, ?, (SELECT COALESCE(MAX(place) + 1, 0)\
-      \ FROM group_entries WHERE profile = ? AND chat_id = ?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\
+      \ kind, text, delivery, other_key, other_name, id, tox_id, file_id, file_info, file_size, file_path,\
+      \ file_done, file_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\
       \ ON CONFLICT (profile, id) DO UPDATE SET time = excluded.time,\
       \ what = excluded.what, member_key = excluded.member_key, member_name = excluded.member_name,\
       \ kind = excluded.kind, text = excluded.text, delivery = excluded.delivery,\
-      \ other_key = excluded.other_key, other_name = excluded.other_name"
-      ( (i, chat, i, chat, toMillis time, what)
+      \ other_key = excluded.other_key, other_name = excluded.other_name, tox_id = excluded.tox_id,\
+      \ file_id = excluded.file_id, file_info = excluded.file_info, file_size = excluded.file_size,\
+      \ file_path = excluded.file_path, file_done = excluded.file_done, file_state = excluded.file_state"
+      ( (i, chat, place, toMillis time, what)
       :. ( memberKey <$> member, memberName <$> member
          , if kind == Tox.MessageAction then 1 else 0 :: Int, text, delivery )
-      :. (memberKey <$> other, memberName <$> other, idBytes eid) )
+      :. (memberKey <$> other, memberName <$> other, idBytes eid)
+      :. (fromIntegral <$> messageNumber :: Maybe Int64, groupFileId <$> shared, Info.encode <$> (groupFileInfo =<< shared), attachmentSize <$> attachment)
+      :. (attachmentPath <$> attachment, attachmentDone <$> attachment, fileStateName . attachmentState <$> attachment) )
   InviteChanged (ContactId friend) (GroupId chat) invite ->
     execute db
       "INSERT OR REPLACE INTO invites (profile, friend, chat_id, name, data, answered, password, kind)\
@@ -661,7 +792,23 @@ apply db i = \case
       Declined -> "declined"
       Drafts   -> "drafts"
 
--- | Online if it's not a status.
+-- | A saved status, or online if the number isn't one.
+-- | Where a group entry goes: its own place if it has one, else before the
+-- first newer one, as entries from history are older than what we have.
+entryPlace :: SQLite.Connection -> Int64 -> Text -> UTCTime -> MessageId -> IO Int64
+entryPlace db i chat time (MessageId eid) = SQLite.query db "SELECT place FROM group_entries WHERE profile = ? AND id = ?" (i, eid) >>= \case
+  [Only place] -> pure place
+  _ -> SQLite.query db "SELECT place, time FROM group_entries WHERE profile = ? AND chat_id = ? ORDER BY place DESC LIMIT 1" (i, chat) >>= \case
+    [] -> pure 0
+    (newest, newestTime) : _
+      | newestTime <= (toMillis time :: Integer) -> pure (newest + 1)
+      | otherwise -> do
+          [Only place] <- SQLite.query db "SELECT MIN(place) FROM group_entries WHERE profile = ? AND chat_id = ? AND time > ?" (i, chat, toMillis time)
+          -- Twice, as each row must stay unique on the way.
+          execute db "UPDATE group_entries SET place = -place - 1 WHERE profile = ? AND chat_id = ? AND place >= ?" (i, chat, place)
+          execute db "UPDATE group_entries SET place = -place WHERE profile = ? AND chat_id = ? AND place < 0" (i, chat)
+          pure place
+
 awayOf :: Int -> Tox.UserStatus
 awayOf n = if n >= 0 && n <= fromEnum (maxBound :: Tox.UserStatus) then toEnum n else Tox.Online
 
@@ -676,6 +823,58 @@ toMillis' = round . (* 1000)
 
 fromMillis' :: Integer -> NominalDiffTime
 fromMillis' = (/ 1000) . fromIntegral
+
+-- | Settings by name: those without a row have their defaults.
+type Named = Map Text SQLite.SQLData
+
+accountSettings :: Named -> AccountSettings
+accountSettings named = AccountSettings
+  { settingAutoAccept = maybe (settingAutoAccept defaults) fromIntegral (integerIn named "auto_accept")
+  , settingTyping = maybe (settingTyping defaults) (/= 0) (integerIn named "typing")
+  }
+  where defaults = clientAccount initialClient
+
+accountRows :: AccountSettings -> [(Text, SQLite.SQLData)]
+accountRows account =
+  [ ("auto_accept", integer (settingAutoAccept account))
+  , ("typing", integer (fromEnum (settingTyping account)))
+  ]
+
+deviceSettings :: Named -> DeviceSettings
+deviceSettings named = DeviceSettings
+  { settingUdp = flag settingUdp "udp"
+  , settingIpv6 = flag settingIpv6 "ipv6"
+  , settingLan = flag settingLan "lan"
+  , settingStay = flag settingStay "stay_online"
+  , settingProxy = Tox.Proxy <$> (proxyKind =<< textIn named "proxy_type") <*> (Text.unpack <$> textIn named "proxy_host")
+      <*> (fromIntegral <$> integerIn named "proxy_port")
+  }
+  where flag field name = maybe (field (clientDevice initialClient)) (/= 0) (integerIn named name)
+
+-- | Each setting's row, none for one without a value.
+deviceRows :: DeviceSettings -> [(Text, Maybe SQLite.SQLData)]
+deviceRows device =
+  [ ("udp", flag settingUdp), ("ipv6", flag settingIpv6), ("lan", flag settingLan), ("stay_online", flag settingStay)
+  , ("proxy_type", SQLite.SQLText . proxyKindName . Tox.proxyType <$> proxy)
+  , ("proxy_host", SQLite.SQLText . Text.pack . Tox.proxyHost <$> proxy)
+  , ("proxy_port", integer . Tox.proxyPort <$> proxy)
+  ]
+  where
+    flag field = Just (integer (fromEnum (field device)))
+    proxy = settingProxy device
+
+integer :: Integral a => a -> SQLite.SQLData
+integer = SQLite.SQLInteger . fromIntegral
+
+integerIn :: Named -> Text -> Maybe Integer
+integerIn named name = case Map.lookup name named of
+  Just (SQLite.SQLInteger n) -> Just (toInteger n)
+  _                          -> Nothing
+
+textIn :: Named -> Text -> Maybe Text
+textIn named name = case Map.lookup name named of
+  Just (SQLite.SQLText t) -> Just t
+  _                       -> Nothing
 
 proxyKindName :: Tox.ProxyType -> Text
 proxyKindName = \case

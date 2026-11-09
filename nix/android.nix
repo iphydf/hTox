@@ -1,4 +1,4 @@
-# App's shared library for Android.
+# The app's shared library for Android.
 { androidArch ? "aarch64" }:
 let
   hatter = import ./hatter.nix;
@@ -46,9 +46,9 @@ let
     withStatic = true;
     withShared = false;
   }).overrideAttrs (old: {
-    # MediaCodec needs ffmpeg to know it's on Android, not plain Linux.
+    # nixpkgs says Linux.
     configureFlags = map (f: if f == "--target_os=linux" then "--target_os=android" else f) old.configureFlags
-      ++ [ "--enable-pic" "--enable-jni" "--enable-mediacodec" ];
+      ++ [ "--enable-pic" ];
   });
   # For SQLCipher. We only use libcrypto, and kernel TLS doesn't build for
   # Android.
@@ -117,7 +117,6 @@ lib.mkAndroidLib {
     "${libvpx}/lib/libvpx.a"
     "${libopus}/lib/libopus.a"
     "-lmediandk"
-    "-landroid"
   ];
   # Hatter's sources are in the build directory, but we use it from the
   # package database.
