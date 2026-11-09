@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | Model with friends and chats, made from events.
+-- | A model with friends and chats, made from events.
 module HTox.Sample
   ( alice
   , bob
@@ -20,6 +20,8 @@ import           Data.Time                   (UTCTime (..), fromGregorian,
 
 import qualified Data.Map.Strict             as Map
 import qualified Tox.Application.Tox         as Tox
+import qualified Tox.AV                      as AV
+import qualified Tox.AV.Playout              as Playout
 import           Tox.Client                  (initialClient)
 import qualified Tox.Client.Debug            as Debug
 import           Tox.Client.Types            (unused)
@@ -67,7 +69,7 @@ history =
   , ClientEvent (Client.FriendOnline alice True)
   , ClientEvent (Client.Received alice (at 1 15 14) Tox.MessageNormal "Hi! Is this the Haskell client?")
   , Open (Chat alice)
-  , DraftChanged "It is, and it's on the network now."
+  , DraftChanged "It is, and it's on the network now." (at 1 0 0)
   , Send (at 1 15 15)
   , ClientEvent (Client.Confirmed alice (made 1) 1 (at 1 15 16))
   , Back
@@ -98,4 +100,7 @@ sampleReport = Debug.Report
       , (Tox.RelayLink Tox.Sent, Tox.Count 2 3072)
       , (Tox.Requests Tox.SearchFriend, Tox.Count 7 1400)
       ]
+  , Debug.reportCalls =
+      [ Debug.Call "1d16d2ab" (Playout.Stats 3 1 2 0) (Just (AV.VideoStats 600 5 7 22 2 3 66 598 0))
+          (Just "c2.exynos.h264.encoder, NV12 480x640 in rows of 512, planes of 640") ]
   }

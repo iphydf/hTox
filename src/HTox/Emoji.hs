@@ -20,7 +20,7 @@ emojiOnly = go 0 . map ord . Text.unpack
       | n >= maxEmoji = False
       | otherwise = maybe False (go (n + 1)) (emoji cs)
 
--- | Rest after 1 emoji at the start.
+-- | What's left after 1 emoji at the start.
 emoji :: [Int] -> Maybe [Int]
 emoji cs = case cs of
   -- Flag (2 regional indicators).

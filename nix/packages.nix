@@ -41,11 +41,16 @@ in
   toxcore = doJailbreak (library "toxcore" ../../hs-toxcore);
   toxsync = library "toxsync" ../../hs-toxsync;
   tox = library "tox" ../../hs-tox;
+  toxcore-c = libraryWith { toxcore = pkgs.callPackage ./c-toxcore.nix { }; } "toxcore-c" ../../hs-toxcore-c;
+  tox-c = library "tox-c" ../../hs-tox/c;
   toxav = libraryWith
     {
       libavcodec = pkgs.ffmpeg;
       ffmpeg = pkgs.ffmpeg;
       opus = pkgs.libopus;
     } "toxav" ../../hs-toxav;
+  # hs-toxav on Android links Android's MediaCodec library, which its NDK
+  # brings.
+  mediandk = null;
   qrcode-core = doJailbreak (markUnbroken super.qrcode-core);
 }

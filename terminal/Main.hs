@@ -2,16 +2,18 @@
 -- | hTox in a terminal, with the icons as characters.
 module Main (main) where
 
-import qualified Data.Map.Strict as Map
-import           Data.Text       (Text)
-import           Hatter.Terminal (TerminalConfig (..), runTerminal,
-                                  terminalConfig)
-import           Hatter.Widget   (ResourceName (..))
+import qualified Data.Map.Strict      as Map
+import           Data.Text            (Text)
+import           Hatter.Terminal      (TerminalConfig (..), runTerminal,
+                                       terminalConfig)
+import           Hatter.Widget        (ResourceName (..))
+import           Tox.Client.Toxcore   (hsToxcore)
+import           Tox.Client.Toxcore.C (cToxcore)
 
-import           HTox.App        (app)
+import           HTox.App             (app)
 
 main :: IO ()
-main = runTerminal (terminalConfig "htox") { terminalGlyph = (`Map.lookup` icons) . unResourceName } app
+main = runTerminal (terminalConfig "htox") { terminalGlyph = (`Map.lookup` icons) . unResourceName } (app [hsToxcore, cToxcore])
 
 icons :: Map.Map Text Text
 icons = Map.fromList

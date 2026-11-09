@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE StrictData        #-}
 -- | Widgets of each screen.
 module HTox.View
   ( Env (..)
@@ -8,37 +9,46 @@ module HTox.View
   , startFailure
   , peerStream
   , selfStream
+  , toxcoreName
   ) where
 
-import qualified Data.ByteString      as BS
-import           Data.Char            (toLower)
-import           Data.List            (find, sortOn)
-import qualified Data.Map.Strict      as Map
-import           Data.Maybe           (isJust, isNothing, listToMaybe)
-import qualified Data.Set             as Set
-import           Data.Text            (Text)
-import qualified Data.Text            as Text
-import           Data.Time            (Day, TimeZone, UTCTime,
-                                       defaultTimeLocale, diffDays, diffUTCTime,
-                                       formatTime, localDay,
-                                       toModifiedJulianDay, utcToLocalTime)
-import           Data.Word            (Word64)
-import           Hatter.Action        (Action, OnChange, OnScroll)
+import qualified Data.ByteString           as BS
+import qualified Data.ByteString.Base16    as Base16
+import           Data.Char                 (toLower)
+import           Data.Containers.ListUtils (nubOrdOn)
+import           Data.List                 (find, sortOn)
+import qualified Data.Map.Strict           as Map
+import           Data.Maybe                (fromMaybe, isJust, isNothing,
+                                            listToMaybe)
+import qualified Data.Set                  as Set
+import           Data.Text                 (Text)
+import qualified Data.Text                 as Text
+import qualified Data.Text.Encoding        as Text
+import           Data.Time                 (Day, TimeZone, UTCTime,
+                                            defaultTimeLocale, diffDays,
+                                            diffUTCTime, formatTime, localDay,
+                                            toModifiedJulianDay, utcToLocalTime)
+import           Data.Word                 (Word64)
+import           Hatter.Action             (Action, OnChange, OnScroll)
 import           Hatter.Widget
-import           Numeric              (showFFloat)
-import           System.FilePath      (takeExtension)
-import qualified Tox.Application.Tox  as Tox
-import qualified Tox.Client.Debug     as Debug
-import qualified Tox.Client.Formats   as Formats
-import           Tox.Client.Locations (location)
-import           Tox.Client.Pictures  (PictureFormat (..), pictureFormat)
-import           Tox.Client.Types     (MessageId (..))
-import qualified Tox.Core.Lanes       as Lanes
+import           Numeric                   (showFFloat)
+import           System.FilePath           (takeExtension)
+import qualified Tox.Application.Tox       as Tox
+import qualified Tox.Client.Debug          as Debug
+import qualified Tox.Client.Home           as Home
+import           Tox.Client.Locations      (location)
+import           Tox.Client.Pictures       (PictureFormat (..), pictureFormat)
+import           Tox.Client.Types          (MessageId (..), entryText,
+                                            noticeText, shownMessage,
+                                            shownText)
+import qualified Tox.Client.Update         as Client
+import qualified Tox.Core.Lanes            as Lanes
+import qualified Tox.Sync.Id               as Sync
 
-import           HTox.Emoji           (emojiOnly)
+import           HTox.Emoji                (emojiOnly)
 import           HTox.Model
 import           HTox.Theme
-import           HTox.Version         (version)
+import           HTox.Version              (version)
 
 -- | What widgets need besides the model.
 data Env = Env
@@ -57,6 +67,14 @@ data Env = Env
     -- ^ Another profile's call.
   , envOthers      :: [(ProfileId, ProfileSummary)]
     -- ^ The other profiles, online too.
+  , envSchema      :: Int
+    -- ^ The database's version.
+  , envGraphics    :: Text
+    -- ^ What draws the window, where the platform says.
+  , envToxcores    :: [Toxcore]
+    -- ^ The Tox libraries this build has.
+  , envToxcore     :: Toxcore
+    -- ^ The one running.
   }
 
 data Handlers = Handlers
@@ -78,7 +96,11 @@ data Handlers = Handlers
   , hTapMessage         :: ContactId -> MessageId -> Action
     -- ^ Opens a file, or accepts one that's waiting.
   , hHoldMessage        :: ContactId -> MessageId -> Action
+  , hTapEntry           :: GroupId -> MessageId -> Action
+    -- ^ Selects it while others are selected.
+  , hHoldEntry          :: GroupId -> MessageId -> Action
   , hCancelFile         :: ContactId -> MessageId -> Action
+  , hSendAgain          :: ContactId -> MessageId -> Action
   , hUnselect           :: Action
   , hCopySelected       :: Action
   , hForwardSelected    :: Action
@@ -104,8 +126,9 @@ data Handlers = Handlers
   , hToggleIpv6         :: Action
   , hToggleLan          :: Action
   , hToggleStay         :: Action
-  , hToggleFormat       :: Text -> Action
+  , hToggleTyping       :: Action
   , hOpenProxy          :: Action
+  , hChooseToxcore      :: Action
   , hProxyKind          :: Maybe Tox.ProxyType -> Action
   , hProxyHost          :: OnChange
   , hProxyPort          :: OnChange
@@ -117,9 +140,12 @@ data Handlers = Handlers
   , hDetails            :: ContactId -> Action
   , hMuteChat           :: ContactId -> Action
   , hDelete             :: ContactId -> Action
+  , hHoldChat           :: ContactId -> Action
+    -- ^ The chat's menu in the chat list.
   , hCopyKey            :: ContactId -> Action
   , hPictures           :: ContactId -> Action
     -- ^ Offers the picture formats.
+  , hHideAfterZero      :: ContactId -> Action
   , hDraft              :: OnChange
   , hNickname           :: OnChange
   , hStatus             :: OnChange
@@ -144,8 +170,10 @@ data Handlers = Handlers
   , hOpenGroup          :: GroupId -> Action
   , hGroupDetails       :: GroupId -> Action
   , hMuteGroup          :: GroupId -> Action
+  , hGroupPictures      :: GroupId -> Action
   , hLeaveGroup         :: GroupId -> Action
   , hDeleteGroup        :: GroupId -> Action
+  , hHoldGroup          :: GroupId -> Action
   , hCopyChatId         :: GroupId -> Action
   , hOpenInvite         :: ContactId -> GroupId -> Action
   , hJoin               :: ContactId -> GroupId -> Action
@@ -164,6 +192,9 @@ data Handlers = Handlers
   , hInviteFriend       :: GroupId -> ContactId -> Action
   , hMember             :: GroupId -> Tox.PeerId -> Action
     -- ^ Opens the member menu.
+  , hGroupFile          :: GroupId -> BS.ByteString -> Action
+  , hPauseGroupFile     :: GroupId -> BS.ByteString -> Action
+    -- ^ Downloads a file shared in the group.
   , hEndPrivate         :: Action
   , hGroupSettings      :: GroupId -> Action
   , hPrivacy            :: GroupId -> Action
@@ -177,6 +208,11 @@ data Handlers = Handlers
   , hOpenLink           :: Action
   , hLinkEdited         :: OnChange
   , hLink               :: Action
+  , hUnlock             :: Action
+  , hOpenDevices        :: Action
+  , hPairDevice         :: Action
+  , hRemoveDevice       :: ContactId -> Action
+  , hCopyPairing        :: Action
   }
 
 view :: Env -> Handlers -> Model -> Widget
@@ -197,10 +233,13 @@ screen env h model = case modelScreen model of
       Details cid   -> maybe (contacts env h model) (details env h cid)
                          (Map.lookup cid (clientContacts client))
       Forward _ _   -> forward env h model
-      MessageInfo cid i
+      MessageInfo (Client.FriendChat cid) i
         | Just contact <- Map.lookup cid (clientContacts client)
         , Just m <- find ((== i) . messageId) (contactMessages contact) -> messageInfo env h cid contact m
-        | otherwise -> contacts env h model
+      MessageInfo (Client.GroupChat gid) i
+        | Just g <- Map.lookup gid (clientGroups client)
+        , Just e <- find ((== i) . entryId) (groupEntries g) -> groupMessageInfo env h model g e
+      MessageInfo _ _ -> contacts env h model
       CallsScreen   -> calls env h model
       ProfileScreen -> profile env h model
       SettingsScreen -> settings env h model
@@ -220,6 +259,8 @@ screen env h model = case modelScreen model of
       JoinGroupScreen -> joinGroup env h model
       InviteFriendsScreen gid -> maybe (contacts env h model) (inviteFriends env h model gid) (Map.lookup gid (clientGroups client))
       LinkScreen -> linking env h model
+      UnlockScreen -> unlocking env h model
+      DevicesScreen -> devicesScreen env h model
       BackupScreen -> backup env h model
       DebugScreen -> debugScreen env h model
   where client = modelClient model
@@ -242,7 +283,7 @@ contacts env h model = stack $
                 ++ map requestRow (Map.toList (clientRequests client))
                 ++ map chatRow (chatOrder client)
           , Tappable (hOpenAddContact h) $ styled
-              (\s -> s { wsBackgroundColor = Just (pMine p), wsCornerRadius = Just (dp t 16)
+              (\s -> s { wsBackgroundColor = Just (pMine p), wsCorners = Just (rounded (dp t 16))
                        , wsPadding = Just (dp t 18), wsMargin = Just (dp t 16)
                        , wsAlignSelf = Just SelfEnd })
               (icon "ic_add")
@@ -287,53 +328,45 @@ contacts env h model = stack $
     chatRow = \case
       FriendRow cid contact -> contactRow (cid, contact)
       GroupRow gid g -> groupRow gid g
-    groupRow gid@(GroupId chatKey) g = Tappable (hOpenGroup h gid) $ padded t 14 $ row
-      [ middle (avatar env 48 chatKey Nothing)
+    groupRow gid@(GroupId chatKey) g = listRow (hOpenGroup h gid) (hHoldGroup h gid) (avatar env 48 chatKey Nothing)
+      (row [ middle (styled (\s -> s { wsWidth = Just (dp t 16), wsHeight = Just (dp t 16) }) (icon "ic_group"))
+           , gap t 6
+           , grow (middle (maxLines 1 (labelIn (if groupUnread g > 0 then bold else id) 16 (pText p) (groupLabel g)))) ])
+      (groupMuted (envNow env) g) (maybe "" (listTime env . entryTime) (lastEntry g))
+      (case Map.lookup gid (clientGroupDrafts client) of
+         Just draft | not (Text.null (Text.strip draft)) -> row
+           [label 14 (pError p) "Draft: ", grow (maxLines 1 (label 14 (pMuted p) draft))]
+         _ -> maxLines 1 (labelIn (if any (isJust . noticeText . entryWhat) (lastEntry g) then italic else id) 14 (pMuted p)
+                (maybe (phaseText (groupPhase g)) (entryPreview (uttered (clientProfile client) g)) (lastEntry g))))
+      (groupUnread g)
+    contactRow (cid@(ContactId key), contact) = listRow (hOpenChat h cid) (hHoldChat h cid) (avatar env 48 key (Just (contactOnline contact)))
+      (maxLines 1 (labelIn (if contactUnread contact > 0 then bold else id) 16 (pText p) (contactLabel cid contact)))
+      (muted (envNow env) contact) (maybe "" (listTime env . messageTime) (lastMessage contact))
+      (case Map.lookup cid (clientDrafts client) of
+         _ | Set.member cid (clientTyping client) -> label 14 (pAccent p) "typing\x2026"
+         Just draft | not (Text.null (Text.strip draft)) -> row
+           [label 14 (pError p) "Draft: ", grow (maxLines 1 (label 14 (pMuted p) draft))]
+         _ -> maxLines 1 (labelIn (if any (isJust . messageCall) (lastMessage contact) then italic else id) 14 (pMuted p)
+                (maybe (waiting contact) (preview (contactHideAfterZero contact) (contactLabel cid contact)) (lastMessage contact))))
+      (contactUnread contact)
+    -- The name, whether it's muted and when on top, the latest and how many
+    -- are unread below.
+    listRow open hold picture name silent time latest unread = Tappable open $ LongPressable hold $ padded t 14 $ row
+      [ middle picture
       , gap t 16
       , grow $ middle $ column
-          [ row [ middle (styled (\s -> s { wsWidth = Just (dp t 16), wsHeight = Just (dp t 16) }) (icon "ic_group"))
-                , gap t 6
-                , grow (middle (labelIn (if groupUnread g > 0 then bold else id) 16 (pText p) (groupLabel g))) ]
-          , case Map.lookup gid (clientGroupDrafts client) of
-              Just draft | not (Text.null (Text.strip draft)) -> row
-                [label 14 (pError p) "Draft: ", grow (maxLines 1 (label 14 (pMuted p) draft))]
-              _ -> maxLines 1 (label 14 (pMuted p) (maybe (phaseText (groupPhase g)) (entryPreview (uttered (clientProfile client) g)) (lastEntry g)))
+          [ row $ grow (middle name)
+              : [ middle (styled (\s -> s { wsWidth = Just (dp t 16), wsHeight = Just (dp t 16), wsMargin = Just (dp t 4) })
+                           (icon "ic_notifications_off"))
+                | silent ]
+              ++ [gap t 4, middle (label 12 (pMuted p) time)]
+          , row $ grow (middle latest)
+              : [ middle $ styled (\s -> s { wsBackgroundColor = Just (if silent then pMuted p else pAccent p)
+                                          , wsCorners = Just (rounded (dp t 10)), wsPadding = Just (dp t 4)
+                                          , wsMargin = Just (dp t 2) }) $
+                    label 12 (pOnAccent p) (Text.pack (show unread))
+                | unread > 0 ]
           ]
-      , middle $ column $
-          styled (\s -> s { wsAlignSelf = Just SelfEnd })
-            (label 12 (pMuted p) (maybe "" (listTime env . entryTime) (lastEntry g)))
-          : [ styled (\s -> s { wsAlignSelf = Just SelfEnd, wsWidth = Just (dp t 16), wsHeight = Just (dp t 16) })
-                (icon "ic_notifications_off")
-            | groupMuted (envNow env) g ]
-          ++ [ styled (\s -> s { wsAlignSelf = Just SelfEnd
-                            , wsBackgroundColor = Just (if groupMuted (envNow env) g then pMuted p else pAccent p)
-                            , wsCornerRadius = Just (dp t 10), wsPadding = Just (dp t 4)
-                            , wsMargin = Just (dp t 2) }) $
-              label 12 (pOnAccent p) (Text.pack (show (groupUnread g)))
-          | groupUnread g > 0 ]
-      ]
-    contactRow (cid@(ContactId key), contact) = Tappable (hOpenChat h cid) $ padded t 14 $ row
-      [ middle (avatar env 48 key (Just (contactOnline contact)))
-      , gap t 16
-      , grow $ middle $ column
-          [ labelIn (if contactUnread contact > 0 then bold else id) 16 (pText p) (contactLabel cid contact)
-          , case Map.lookup cid (clientDrafts client) of
-              Just draft | not (Text.null (Text.strip draft)) -> row
-                [label 14 (pError p) "Draft: ", grow (maxLines 1 (label 14 (pMuted p) draft))]
-              _ -> maxLines 1 (label 14 (pMuted p) (maybe (waiting contact) (preview (contactLabel cid contact)) (lastMessage contact)))
-          ]
-      , middle $ column $
-          styled (\s -> s { wsAlignSelf = Just SelfEnd })
-            (label 12 (pMuted p) (maybe "" (listTime env . messageTime) (lastMessage contact)))
-          : [ styled (\s -> s { wsAlignSelf = Just SelfEnd, wsWidth = Just (dp t 16), wsHeight = Just (dp t 16) })
-                (icon "ic_notifications_off")
-            | muted (envNow env) contact ]
-          ++ [ styled (\s -> s { wsAlignSelf = Just SelfEnd
-                            , wsBackgroundColor = Just (if muted (envNow env) contact then pMuted p else pAccent p)
-                            , wsCornerRadius = Just (dp t 10), wsPadding = Just (dp t 4)
-                            , wsMargin = Just (dp t 2) }) $
-              label 12 (pOnAccent p) (Text.pack (show (contactUnread contact)))
-          | contactUnread contact > 0 ]
       ]
     waiting contact = maybe "" (const "Friend request sent") (contactRequest contact)
     drawer = stack
@@ -368,7 +401,7 @@ contacts env h model = stack $
           , label 14 (pMuted p) (connectionText (summaryConnection summary))
           ]
       ]
-      ++ [ middle $ styled (\s -> s { wsBackgroundColor = Just (pAccent p), wsCornerRadius = Just (dp t 10)
+      ++ [ middle $ styled (\s -> s { wsBackgroundColor = Just (pAccent p), wsCorners = Just (rounded (dp t 10))
                                     , wsPadding = Just (dp t 4) }) $
              label 12 (pOnAccent p) (Text.pack (show (summaryUnread summary)))
          | summaryUnread summary > 0 ]
@@ -397,7 +430,7 @@ calls env h model = column $
          ]
      | not (modelFullScreen model) ]
   ++
-  [ grow $ case [ (cid, c, m, record) | (cid, m, record) <- callHistory client
+  [ grow $ case [ (cid, c, m, record) | (cid, m, record) <- callHistory (modelCalls model) client
                                       , Just c <- [Map.lookup cid (clientContacts client)] ] of
       []      -> stack [middle (label 16 (pMuted p) "No calls yet")]
       history -> scrollColumn (map callRow history)
@@ -432,19 +465,15 @@ callIcon mine record
 chat :: Env -> Handlers -> Model -> ContactId -> Contact -> Widget
 chat env h model cid@(ContactId key) contact = column $
   [ if not (Set.null (modelSelected model))
-      then styled (\s -> s { wsBackgroundColor = Just (pBar p) }) $ appBar t
-        [ iconButton t (hUnselect h) "ic_close"
-        , gap t 8
-        , grow (middle (label 22 (pText p) (Text.pack (show (Set.size (modelSelected model))) <> " selected")))
-        , iconButton t (hCopySelected h) "ic_content_copy"
-        , iconButton t (hForwardSelected h) "ic_forward"
-        ]
+      then selectionBar env h model
       else styled (\s -> s { wsBackgroundColor = Just (pBar p) }) $ appBar t $
       [ iconButton t (hBack h) "ic_arrow_back"
       , grow $ Tappable (hDetails h cid) $ row
           [ middle (avatar env 40 key (Just (contactOnline contact)))
           , gap t 16
-          , grow (middle (label 22 (pText p) (contactLabel cid contact)))
+          , grow $ middle $ column $
+              label 22 (pText p) (contactLabel cid contact)
+              : [label 14 (pAccent p) "typing\x2026" | Set.member cid (clientTyping (modelClient model))]
           ]
       ]
       ++ concat [ [iconButton t (hCall h True) "ic_videocam", iconButton t (hCall h False) "ic_call"]
@@ -457,7 +486,7 @@ chat env h model cid@(ContactId key) contact = column $
       : [ styled (\s -> s { wsAlignSelf = Just SelfEnd, wsMargin = Just (dp t 12) }) $ column
             [ grow (text "")
             , Tappable (hJump h) $ styled
-                (\s -> s { wsBackgroundColor = Just (pTheirs p), wsCornerRadius = Just (dp t 24)
+                (\s -> s { wsBackgroundColor = Just (pTheirs p), wsCorners = Just (rounded (dp t 24))
                          , wsPadding = Just (dp t 12) }) $
                 label 16 (pText p) (if modelUnseen model > 0 then "\x2193 " <> Text.pack (show (modelUnseen model)) else "\x2193")
             ]
@@ -466,22 +495,15 @@ chat env h model cid@(ContactId key) contact = column $
   ++ [ styled (\s -> s { wsAlignSelf = Just SelfCenter, wsPadding = Just (dp t 8) }) (label 14 (pError p) notice)
      | Just notice <- [modelNotice model] ]
   ++ [ styled (\s -> s { wsPadding = Just (dp t 8) }) $ scrollRow (zipWith tile [0 ..] staged) | not (null staged) ]
-  ++ [ styled (\s -> s { wsBackgroundColor = Just (pTheirs p), wsPadding = Just (dp t 8)
-                       , wsMargin = Just (dp t 8), wsCornerRadius = Just (dp t 12) }) $ row
-         [ middle (icon "ic_reply")
-         , gap t 8
-         , grow $ middle $ maxLines 3 $ label 14 (pMuted p) (quoted m)
-         , middle (iconButton t (hCancelReply h) "ic_close")
-         ]
-     | Just i <- [Map.lookup cid (clientReplies client)], Just m <- [find ((== i) . messageId) (contactMessages contact)] ]
+  ++ [ replyBar env h quote | Just quote <- [replied client (Client.FriendChat cid)] ]
   ++
   [ row
       [ grow $ middle $ styled
-          (\s -> s { wsBackgroundColor = Just (pTheirs p), wsCornerRadius = Just (dp t 28)
+          (\s -> s { wsBackgroundColor = Just (pTheirs p), wsCorners = Just (rounded (dp t 28))
                    , wsPadding = Just (dp t 16), wsMargin = Just (dp t 8) })
           (maxLines 3 (input InputMultiline (hDraft h) "Tox message" draft))
       , middle $ Tappable (if writing then hSend h else hAttach h) $ styled
-          (\s -> s { wsBackgroundColor = Just (pMine p), wsCornerRadius = Just (dp t 26)
+          (\s -> s { wsBackgroundColor = Just (pMine p), wsCorners = Just (rounded (dp t 26))
                    , wsPadding = Just (dp t 14), wsMargin = Just (dp t 8) })
           (icon (if writing then "ic_send" else "ic_attach_file"))
       ]
@@ -493,13 +515,13 @@ chat env h model cid@(ContactId key) contact = column $
     draft = Map.findWithDefault "" cid (clientDrafts client)
     staged = Map.findWithDefault [] cid (clientStaged client)
     writing = not (Text.null (Text.strip draft)) || not (null staged)
-    tile k picked = styled (\s -> s { wsBackgroundColor = Just (pTheirs p), wsCornerRadius = Just (dp t 12)
+    tile k picked = styled (\s -> s { wsBackgroundColor = Just (pTheirs p), wsCorners = Just (rounded (dp t 12))
                                   , wsMargin = Just (dp t 4), wsPadding = Just (dp t 4) }) $ column
       [ styled (\s -> s { wsAlignSelf = Just SelfEnd }) (iconButton t (hUnstage h cid k) "ic_close")
       , case picked of
           StagedFile path name _ _
             | isPicture path || isJust (envDecoded env path) ->
-                styled (\s -> s { wsWidth = Just (dp t 96), wsHeight = Just (dp t 96), wsCornerRadius = Just (dp t 8) }) $
+                styled (\s -> s { wsWidth = Just (dp t 96), wsHeight = Just (dp t 96), wsCorners = Just (rounded (dp t 8)) }) $
                   Image ImageConfig
                     { icSource = maybe (ImageFile path) ImageData (envDecoded env path), icScaleType = ScaleFill }
             | otherwise -> styled (\s -> s { wsWidth = Just (dp t 96) }) $ column
@@ -513,48 +535,44 @@ chat env h model cid@(ContactId key) contact = column $
     messages previous (m : ms) =
       [ keyedItem (dayKey (day m)) $ styled (\s -> s { wsAlignSelf = Just SelfCenter, wsPadding = Just (dp t 8) }) $
           label 14 (pMuted p) (dayHeading env (messageTime m))
-      | Just (day m) /= previous ]
-      ++ keyedItem (messageKey (messageId m)) (held (messageId m) (bubble (messageId m) m (maybe True (not . together m) (listToMaybe ms))))
-      : messages (Just (day m)) ms
-    held i b = Tappable (hTapMessage h cid i) $ LongPressable (hHoldMessage h cid i) $
-      if Set.member i (modelSelected model)
-        then styled (\s -> s { wsBackgroundColor = Just (pDivider p), wsAlignSelf = Just SelfStretch }) (column [b])
-        else b
+      | fmap day previous /= Just (day m) ]
+      ++ let first = maybe True (\b -> not (together b m)) previous
+         in keyedItem (messageKey (messageId m))
+              (held (messageId m) (spaced t first (bubble (messageId m) m first (maybe True (not . together m) (listToMaybe ms)))))
+            : messages (Just m) ms
+    held i = selectable env model (hTapMessage h cid i) (hHoldMessage h cid i) i
     day = localDay . utcToLocalTime (envZone env) . messageTime
     -- Messages from the same side close together form a run, which only
     -- shows the time of its last message.
     together m n = messageMine m == messageMine n && day m == day n
       && diffUTCTime (messageTime n) (messageTime m) < 180
       && all (\x -> isNothing (messageCall x) && isNothing (messageFile x)) [m, n]
-    box m = styled
-      (\s -> s { wsBackgroundColor = Just (if messageMine m then pMine p else pTheirs p)
-               , wsCornerRadius = Just (dp t 20), wsPadding = Just (dp t 12)
-               , wsMargin = Just (dp t 4)
-               , wsAlignSelf = Just (if messageMine m then SelfEnd else SelfStart) })
-    bubble i m lastOfRun = case (messageCall m, messageFile m) of
+    box first lastOfRun m = styled (bubbleStyle t (messageMine m) first lastOfRun)
+      . styled (\s -> s { wsBackgroundColor = Just (if messageMine m then pMine p else pTheirs p) })
+    bubble i m first lastOfRun = case (messageCall m, messageFile m) of
       (Just record, _) -> styled
-        (\s -> s { wsBackgroundColor = Just (pTheirs p), wsCornerRadius = Just (dp t 16)
+        (\s -> s { wsBackgroundColor = Just (pTheirs p), wsCorners = Just (rounded (dp t 16))
                  , wsPadding = Just (dp t 8), wsMargin = Just (dp t 8), wsAlignSelf = Just SelfCenter }) $ row
         [ middle $ styled (\s -> s { wsWidth = Just (dp t 16), wsHeight = Just (dp t 16) })
             (icon (callIcon (messageMine m) record))
         , gap t 8
-        , middle (label 13 (if recordMissed record then pError p else pText p) (preview "" m))
+        , middle (label 13 (if recordMissed record then pError p else pText p) (preview False "" m))
         , gap t 8
         , middle (stamp m)
         ]
       (_, Nothing)
-        | messageKind m == Tox.MessageNormal, emojiOnly (messageText m) ->
-            styled (\s -> s { wsMargin = Just (dp t 4), wsAlignSelf = Just (if messageMine m then SelfEnd else SelfStart) }) $
-              column $ label 48 (pText p) (messageText m)
+        | messageKind m == Tox.MessageNormal, emojiOnly (shownMessage contact m) ->
+            styled (\s -> s { wsMargin = Just (dp t bubbleMargin), wsAlignSelf = Just (if messageMine m then SelfEnd else SelfStart) }) $
+              column $ label 48 (pText p) (shownMessage contact m)
                 : [ styled (\s -> s { wsAlignSelf = Just (if messageMine m then SelfEnd else SelfStart) }) (stamp m) | lastOfRun ]
-      (_, Nothing) -> box m $ row $
-        [ styled (\s -> s { wsMaxWidth = Just (thScreenWidth t * 0.6) }) $ case location (messageText m) of
+      (_, Nothing) -> box first lastOfRun m $ row $
+        [ styled (\s -> s { wsMaxWidth = Just (thScreenWidth t * 0.6) }) $ case location (shownMessage contact m) of
             -- A tap opens the maps app.
             Just (latitude, longitude) -> column
-              [ label 16 (pText p) (preview (contactLabel cid contact) m)
+              [ label 16 (pText p) (preview (contactHideAfterZero contact) (contactLabel cid contact) m)
               , label 13 (pMuted p) (Text.pack (showFFloat (Just 5) latitude "" <> ", " <> showFFloat (Just 5) longitude ""))
               ]
-            Nothing -> label 16 (pText p) (preview (contactLabel cid contact) m)
+            Nothing -> label 16 (pText p) (preview (contactHideAfterZero contact) (contactLabel cid contact) m)
         ]
         ++ concat [ [gap t 8, stamp m] | lastOfRun ]
         -- Within a run, only show that it's pending.
@@ -563,9 +581,9 @@ chat env h model cid@(ContactId key) contact = column $
       (_, Just file)
         | isPicture (attachmentPath file) || isJust (envDecoded env (attachmentPath file))
         , messageMine m || attachmentState file == Complete ->
-            box m $ column $
+            box True True m $ column $
               [ styled (\s -> s { wsWidth = Just pictureWidth, wsHeight = Just (pictureHeight (attachmentPath file))
-                                , wsCornerRadius = Just (dp t 12) }) $
+                                , wsCorners = Just (rounded (dp t 12)) }) $
                   Image ImageConfig
                     { icSource = maybe (ImageFile (attachmentPath file)) ImageData (envDecoded env (attachmentPath file))
                     , icScaleType = ScaleFill }
@@ -573,23 +591,29 @@ chat env h model cid@(ContactId key) contact = column $
               ]
               ++ [ row (middle (label 13 (pMuted p) (fileStatus True file)) : stopping i m file)
                  | attachmentState file /= Complete ]
+              ++ again i m file
               ++ [stamp m]
-        | otherwise -> box m $ row $
+        | otherwise -> box True True m $ row $
             [ middle $ styled (\s -> s { wsWidth = Just (dp t 36), wsHeight = Just (dp t 36) })
                 (icon "ic_insert_drive_file")
             , gap t 8
             , middle $ styled (\s -> s { wsMaxWidth = Just (thScreenWidth t * 0.5) }) $ column $
-                [ maxLines 2 (label 16 (pText p) (messageText m))
+                [ maxLines 2 (label 16 (pText p) (shownMessage contact m))
                 , label 13 (pMuted p) (fileStatus (messageMine m) file)
                 ]
                 ++ [ row [pill t (pMine p) (hTapMessage h cid i) "Accept", gap t 8, pill t (pTheirs p) (hCancelFile h cid i) "Decline"]
                    | not (messageMine m), attachmentState file == Waiting ]
+                ++ again i m file
             ]
             ++ stopping i m file
             ++ [gap t 8, stamp m]
     stopping i m file =
       [ middle (iconButton t (hCancelFile h cid i) "ic_close")
       | attachmentState file == Moving || (messageMine m && attachmentState file == Waiting) ]
+    -- A linked profile's home device has the file.
+    again i m file =
+      [ row [pill t (pMine p) (hSendAgain h cid i) "Send again"]
+      | messageMine m, attachmentState file == Cancelled, isNothing (clientLinked (modelClient model)) ]
     pictureWidth = thScreenWidth t * 0.6
     -- Height for that width, up to 4:3 upright.
     pictureHeight path = case envPictureSize env path of
@@ -607,6 +631,77 @@ chat env h model cid@(ContactId key) contact = column $
       Sent      -> "ic_done"
       Delivered -> "ic_done_all"
 
+-- | The bar over a chat while messages in it are selected.
+selectionBar :: Env -> Handlers -> Model -> Widget
+selectionBar env h model = styled (\s -> s { wsBackgroundColor = Just (pBar p) }) $ appBar t
+  [ iconButton t (hUnselect h) "ic_close"
+  , gap t 8
+  , grow (middle (label 22 (pText p) (Text.pack (show (Set.size (modelSelected model))) <> " selected")))
+  , iconButton t (hCopySelected h) "ic_content_copy"
+  , iconButton t (hForwardSelected h) "ic_forward"
+  ]
+  where
+    t = envTheme env
+    p = thPalette t
+
+-- | Space around each bubble. Those of a run sit this close, and 'runGap'
+-- sets runs apart.
+bubbleMargin, runGap :: Double
+bubbleMargin = 1
+runGap = 6
+
+-- | A message's bubble on its sender's side. Its corners there are small
+-- where it joins the bubble above or below in its run.
+bubbleStyle :: Theme -> Bool -> Bool -> Bool -> WidgetStyle -> WidgetStyle
+bubbleStyle t mine first lastOfRun s = s
+  { wsCorners = Just (if mine then Corners whole above below whole else Corners above whole whole below)
+  , wsPadding = Just (dp t 12), wsPaddingY = Just (dp t 6), wsMargin = Just (dp t bubbleMargin)
+  , wsAlignSelf = Just (if mine then SelfEnd else SelfStart) }
+  where
+    whole = dp t 20
+    joined = dp t 4
+    above = if first then whole else joined
+    below = if lastOfRun then whole else joined
+
+-- | With the gap above it where it starts a run.
+spaced :: Theme -> Bool -> Widget -> Widget
+spaced t first b
+  | first = styled (\s -> s { wsAlignSelf = Just SelfStretch }) (column [gap t runGap, b])
+  | otherwise = b
+
+-- | A setting that's on or off: what it is, maybe what it does, and its
+-- switch. A tap anywhere on it flips it.
+switchRow :: Env -> Action -> Maybe Text -> Text -> Maybe Text -> Bool -> Widget
+switchRow env action picture name about on = Tappable action $ padded t 16 $ row $
+  concat [[middle (icon resource), gap t 24] | Just resource <- [picture]]
+  ++ [ grow $ middle $ column $ label 16 (pText p) name : [label 14 (pMuted p) a | Just a <- [about]]
+     , gap t 16
+     , middle (switch on action) ]
+  where
+    t = envTheme env
+    p = thPalette t
+
+-- | A tap selects while others are selected, a long press opens its menu.
+selectable :: Env -> Model -> Action -> Action -> MessageId -> Widget -> Widget
+selectable env model tap hold i b = Tappable tap $ LongPressable hold $
+  if Set.member i (modelSelected model)
+    then styled (\s -> s { wsBackgroundColor = Just (pDivider p), wsAlignSelf = Just SelfStretch }) (column [b])
+    else b
+  where p = thPalette (envTheme env)
+
+-- | Over the input: what the draft replies to.
+replyBar :: Env -> Handlers -> Text -> Widget
+replyBar env h quote = styled (\s -> s { wsBackgroundColor = Just (pTheirs p), wsPadding = Just (dp t 8)
+                                       , wsMargin = Just (dp t 8), wsCorners = Just (rounded (dp t 12)) }) $ row
+  [ middle (icon "ic_reply")
+  , gap t 8
+  , grow $ middle $ maxLines 3 $ label 14 (pMuted p) quote
+  , middle (iconButton t (hCancelReply h) "ic_close")
+  ]
+  where
+    t = envTheme env
+    p = thPalette t
+
 -- | Video streams of the friend and us.
 peerStream, selfStream :: Text
 peerStream = "peer"
@@ -620,23 +715,32 @@ lastEntry g = case reverse (groupEntries g) of
 -- | For the chat list, with the sender from 'uttered'.
 entryPreview :: (Member -> Text -> (Text, Text)) -> GroupEntry -> Text
 entryPreview utter (GroupEntry _ what _) = case what of
-  Said who kind body _
+  Said who kind body _ _
     | kind == Tox.MessageAction -> "* " <> by <> " " <> said
     | otherwise -> by <> ": " <> said
-    where (by, said) = maybe ("You", body) (`utter` body) who
-  Arrived who -> memberLabel who <> " joined"
-  Departed who -> memberLabel who <> " left"
-  TopicSet who topic -> maybe "You" memberLabel who <> " set the topic: " <> topic
-  Noted t -> t
-  PrivateFrom who _ said -> memberLabel who <> " (privately): " <> said
-  PrivateTo who _ said _ -> "You to " <> memberLabel who <> " (privately): " <> said
-  Moderated by whom m ->
-    let target = maybe "you" memberLabel whom
-    in maybe "You" memberLabel by <> case m of
-         Tox.ModKick      -> " removed " <> target
-         Tox.ModModerator -> " made " <> target <> " a moderator"
-         Tox.ModUser      -> " made " <> target <> " a member who can speak"
-         Tox.ModObserver  -> " made " <> target <> " an observer"
+    where (by, said) = maybe ("You", shownText False body) (`utter` shownText False body) who
+  SharedFile who file _ -> maybe "You" memberLabel who <> " shared " <> fromMaybe "a file" (groupFileName file)
+  PrivateFrom who _ said -> memberLabel who <> " (privately): " <> shownText False said
+  PrivateTo who _ said _ -> "You to " <> memberLabel who <> " (privately): " <> shownText False said
+  other -> fromMaybe "" (noticeText other)
+
+-- | Joins and leaves in a row show as one line from this many on, as
+-- members on phones come and go all day.
+manyComings :: Int
+manyComings = 3
+
+-- | Who joined and who left, each once: "Alice, Bob and 3 others joined ·
+-- Carol left".
+comings :: [Member] -> [Member] -> Text
+comings came went = Text.intercalate " \x00B7 " $
+  [names came <> " joined" | not (null came)] ++ [names went <> " left" | not (null went)]
+  where
+    names ms = case map memberLabel (nubOrdOn memberKey ms) of
+      [a]          -> a
+      [a, b]       -> a <> " and " <> b
+      [a, b, c]    -> a <> ", " <> b <> " and " <> c
+      a : b : more -> a <> ", " <> b <> " and " <> Text.pack (show (length more)) <> " others"
+      []           -> ""
 
 phaseText :: GroupPhase -> Text
 phaseText = \case
@@ -664,7 +768,8 @@ roleName = \case
 
 groupChat :: Env -> Handlers -> Model -> GroupId -> Group -> Widget
 groupChat env h model gid@(GroupId chatKey) g = column $
-  [ styled (\s -> s { wsBackgroundColor = Just (pBar p) }) $ appBar t
+  [ if not (Set.null (modelSelected model)) then selectionBar env h model else
+    styled (\s -> s { wsBackgroundColor = Just (pBar p) }) $ appBar t
       [ iconButton t (hBack h) "ic_arrow_back"
       , grow $ Tappable (hGroupDetails h gid) $ row
           [ middle (avatar env 40 chatKey Nothing)
@@ -682,7 +787,7 @@ groupChat env h model gid@(GroupId chatKey) g = column $
       : [ styled (\s -> s { wsAlignSelf = Just SelfEnd, wsMargin = Just (dp t 12) }) $ column
             [ grow (text "")
             , Tappable (hJump h) $ styled
-                (\s -> s { wsBackgroundColor = Just (pTheirs p), wsCornerRadius = Just (dp t 24)
+                (\s -> s { wsBackgroundColor = Just (pTheirs p), wsCorners = Just (rounded (dp t 24))
                          , wsPadding = Just (dp t 12) }) $
                 label 16 (pText p) (if modelUnseen model > 0 then "\x2193 " <> Text.pack (show (modelUnseen model)) else "\x2193")
             ]
@@ -691,8 +796,9 @@ groupChat env h model gid@(GroupId chatKey) g = column $
   ++ [ styled (\s -> s { wsAlignSelf = Just SelfCenter, wsPadding = Just (dp t 12) }) $
          label 14 (if groupPhase g == Joining then pMuted p else pError p) (phaseText (groupPhase g))
      | groupPhase g /= InGroup ]
+  ++ [ replyBar env h quote | groupPhase g `elem` [Joining, InGroup], Just quote <- [replied client (Client.GroupChat gid)] ]
   ++ [ styled (\s -> s { wsBackgroundColor = Just (pTheirs p), wsPadding = Just (dp t 8)
-                       , wsMargin = Just (dp t 8), wsCornerRadius = Just (dp t 12) }) $ row
+                       , wsMargin = Just (dp t 8), wsCorners = Just (rounded (dp t 12)) }) $ row
          [ middle (icon "ic_reply")
          , gap t 8
          , grow $ middle $ label 14 (pError p) ("Privately to " <> memberLabel m)
@@ -702,19 +808,21 @@ groupChat env h model gid@(GroupId chatKey) g = column $
   ++
   [ row
       [ grow $ middle $ styled
-          (\s -> s { wsBackgroundColor = Just (pTheirs p), wsCornerRadius = Just (dp t 28)
+          (\s -> s { wsBackgroundColor = Just (pTheirs p), wsCorners = Just (rounded (dp t 28))
                    , wsPadding = Just (dp t 16), wsMargin = Just (dp t 8) })
           (maxLines 3 (input InputMultiline (hDraft h) "Message" (Map.findWithDefault "" gid (clientGroupDrafts client))))
-      , middle $ Tappable (hSend h) $ styled
-          (\s -> s { wsBackgroundColor = Just (pMine p), wsCornerRadius = Just (dp t 26)
+      , middle $ Tappable (if writing then hSend h else hAttach h) $ styled
+          (\s -> s { wsBackgroundColor = Just (pMine p), wsCorners = Just (rounded (dp t 26))
                    , wsPadding = Just (dp t 14), wsMargin = Just (dp t 8) })
-          (icon "ic_send")
+          (icon (if writing then "ic_send" else "ic_attach_file"))
       ]
   | groupPhase g `elem` [Joining, InGroup] ]
   where
     client = modelClient model
     t = envTheme env
     p = thPalette t
+    -- Files go only once we're in.
+    writing = not (Text.null (Text.strip (Map.findWithDefault "" gid (clientGroupDrafts client)))) || groupPhase g /= InGroup
     subtitle = case groupPhase g of
       InGroup -> let n = Map.size (groupMembers g) + 1
                  in memberCount n
@@ -725,18 +833,62 @@ groupChat env h model gid@(GroupId chatKey) g = column $
       [ keyedItem (dayKey (day e)) $ styled (\s -> s { wsAlignSelf = Just SelfCenter, wsPadding = Just (dp t 8) }) $
           label 14 (pMuted p) (dayHeading env (entryTime e))
       | fmap day before /= Just (day e) ]
-      ++ keyedItem (messageKey (entryId e)) (entry (maybe True (\b -> not (together b e)) before) e (maybe True (not . together e) (listToMaybe es)))
-      : entries (Just e) es
+      ++ case span (\x -> comingOrGoing x && day x == day e) (e : es) of
+        (run, rest) | length run >= manyComings ->
+          keyedItem (messageKey (entryId e)) (styled (\s -> s { wsAlignSelf = Just SelfCenter, wsPadding = Just (dp t 4) }) $
+            label 13 (pMuted p) (comings [m | Arrived m <- map entryWhat run] [m | Departed m <- map entryWhat run]))
+          : entries (listToMaybe (reverse run)) rest
+        _ -> let first = maybe True (\b -> not (together b e)) before
+             in keyedItem (messageKey (entryId e)) (held e (spaced t (first && bubbled e) (entry first e (maybe True (not . together e) (listToMaybe es)))))
+          : entries (Just e) es
+    bubbled x = case entryWhat x of
+      Said {}        -> True
+      SharedFile {}  -> True
+      PrivateFrom {} -> True
+      PrivateTo {}   -> True
+      _              -> False
+    -- Only what members wrote.
+    held e
+      | isJust (entryText e) = selectable env model (hTapEntry h gid (entryId e)) (hHoldEntry h gid (entryId e)) (entryId e)
+      | otherwise = id
+    comingOrGoing x = case entryWhat x of
+      Arrived _  -> True
+      Departed _ -> True
+      _          -> False
     -- Sender's name above the first message of their run.
     entry first this lastOfRun = case entryWhat this of
-          Said who kind body delivery ->
+          SharedFile who file _ ->
             let mine = isNothing who
-                (by, said) = maybe ("You", body) (`utter` body) who
-            in styled
-              (\s -> s { wsBackgroundColor = Just (if mine then pMine p else pTheirs p)
-                       , wsCornerRadius = Just (dp t 20), wsPadding = Just (dp t 12)
-                       , wsMargin = Just (dp t 4)
-                       , wsAlignSelf = Just (if mine then SelfEnd else SelfStart) }) $ column $
+                name = fromMaybe "A file" (groupFileName file)
+                bubble = styled (bubbleStyle t mine True True)
+                  . styled (\s -> s { wsBackgroundColor = Just (if mine then pMine p else pTheirs p) }) . column
+                heading = [ labelIn bold 13 (pAccent p) (maybe "You" memberLabel who) | first, not mine ]
+            in bubble $ heading ++ case groupFileData file of
+              Just a | attachmentState a == Complete, isPicture (attachmentPath a) || isJust (envDecoded env (attachmentPath a)) ->
+                [ styled (\s -> s { wsWidth = Just pictureWidth, wsHeight = Just (pictureHeight (attachmentPath a)), wsCorners = Just (rounded (dp t 12)) }) $
+                    Image ImageConfig
+                      { icSource = maybe (ImageFile (attachmentPath a)) ImageData (envDecoded env (attachmentPath a))
+                      , icScaleType = ScaleFill }
+                , stamp mine Delivered (entryTime this) ]
+              attachment ->
+                [ row $
+                    [ middle $ styled (\s -> s { wsWidth = Just (dp t 36), wsHeight = Just (dp t 36) }) (icon "ic_insert_drive_file")
+                    , gap t 8
+                    , middle $ styled (\s -> s { wsMaxWidth = Just (thScreenWidth t * 0.5) }) $ column $
+                        maxLines 2 (label 16 (pText p) name)
+                          : [ label 13 (pMuted p) (groupFileStatus mine file a) | Just a <- [attachment] ]
+                          -- Nothing from a member downloads until asked for.
+                          ++ [ pill t (pMine p) (hGroupFile h gid (groupFileId file)) "Download"
+                             | not mine, Just a <- [attachment], attachmentState a `elem` [Waiting, Interrupted] ]
+                          ++ [ pill t (pTheirs p) (hPauseGroupFile h gid (groupFileId file)) "Pause"
+                             | not mine, Just a <- [attachment], attachmentState a == Moving ]
+                    ]
+                    ++ [gap t 8, stamp mine Delivered (entryTime this)] ]
+          Said who kind body delivery _ ->
+            let mine = isNothing who
+                (by, said) = maybe ("You", shownText False body) (`utter` shownText False body) who
+            in styled (bubbleStyle t mine first lastOfRun)
+              . styled (\s -> s { wsBackgroundColor = Just (if mine then pMine p else pTheirs p) }) $ column $
               [ labelIn bold 13 (pAccent p) by | first, not mine ]
               ++
               [ row $
@@ -744,23 +896,25 @@ groupChat env h model gid@(GroupId chatKey) g = column $
                     (label 16 (pText p) (if kind == Tox.MessageAction then "* " <> by <> " " <> said else said))
                   : concat [ [gap t 8, stamp mine delivery (entryTime this)] | lastOfRun ]
               ]
-          PrivateFrom who _ said -> privately False ("Privately from " <> memberLabel who) said Delivered
-          PrivateTo who _ said delivery -> privately True ("Privately to " <> memberLabel who) said delivery
+          PrivateFrom who _ said -> privately False ("Privately from " <> memberLabel who) (shownText False said) Delivered
+          PrivateTo who _ said delivery -> privately True ("Privately to " <> memberLabel who) (shownText False said) delivery
           _ -> styled (\s -> s { wsAlignSelf = Just SelfCenter, wsPadding = Just (dp t 4) }) $
                  label 13 (pMuted p) (entryPreview utter this)
       where
-        privately mine heading said delivery = styled
-          (\s -> s { wsBackgroundColor = Just (if mine then pMine p else pTheirs p)
-                   , wsCornerRadius = Just (dp t 20), wsPadding = Just (dp t 12), wsMargin = Just (dp t 4)
-                   , wsAlignSelf = Just (if mine then SelfEnd else SelfStart) }) $ column
+        privately mine heading said delivery = styled (bubbleStyle t mine True True)
+          . styled (\s -> s { wsBackgroundColor = Just (if mine then pMine p else pTheirs p) }) $ column
           [ labelIn bold 13 (pError p) heading
           , row [ styled (\s -> s { wsMaxWidth = Just (thScreenWidth t * 0.6) }) (label 16 (pText p) said)
                 , gap t 8, stamp mine delivery (entryTime this) ]
           ]
     utter = uttered (clientProfile client) g
+    pictureWidth = thScreenWidth t * 0.6
+    pictureHeight path = case envPictureSize env path of
+      Just (across, down) | across > 0 -> min (pictureWidth * 4 / 3) (pictureWidth * fromIntegral down / fromIntegral across)
+      _ -> pictureWidth * 3 / 4
     -- Runs as in chats. Relayed messages run by the name relayed.
     together a b = case (entryWhat a, entryWhat b) of
-      (Said x _ tx _, Said y _ ty _) -> fmap memberKey x == fmap memberKey y && fmap (author tx) x == fmap (author ty) y
+      (Said x _ tx _ _, Said y _ ty _ _) -> fmap memberKey x == fmap memberKey y && fmap (author tx) x == fmap (author ty) y
                                         && day a == day b && diffUTCTime (entryTime b) (entryTime a) < 180
       _ -> False
     author body m = fst (utter m body)
@@ -779,6 +933,7 @@ groupDetails env h model gid@(GroupId chatKey) g = column
       , gap t 12
       , middle (label 24 (pText p) (groupLabel g))
       ]
+      ++ [ middle (padded t 4 (label 14 (pMuted p) (groupTopic g))) | not (Text.null (groupTopic g)) ]
       ++ [ middle (padded t 4 (label 14 (pMuted p) (phaseText (groupPhase g)))) | groupPhase g /= InGroup ]
       ++ [ middle (padded t 4 (label 14 (pError p) notice)) | Just notice <- [modelNotice model] ]
       ++
@@ -791,21 +946,33 @@ groupDetails env h model gid@(GroupId chatKey) g = column
                 : [label 13 (pMuted p) until' | silent, Just until' <- [mutedUntil env (groupMute g)]]
           ]
       ]
-      ++ [ Tappable (hToggleMentions h gid) $ padded t 16 $ row
-             [ middle (icon (if groupMentions g then "ic_check_box" else "ic_check_box_outline_blank"))
-             , gap t 24
-             , grow (middle (label 16 (pText p) "Still notify me of mentions"))
-             ]
+      ++ [ switchRow env (hToggleMentions h gid) (Just "ic_notifications") "Still notify me of mentions" Nothing (groupMentions g)
          | silent ]
+      -- Conferences can't share files.
+      ++ [ Tappable (hGroupPictures h gid) $ padded t 16 $ row
+             [ middle (icon "ic_image")
+             , gap t 24
+             , grow $ middle $ column
+                 [ label 16 (pText p) "Send pictures"
+                 , label 13 (pMuted p) $ maybe "As they are" (("As " <>) . formatName) (pictureFormat =<< groupPictures g)
+                 ]
+             ]
+         | groupKind g == NgcGroup ]
+      ++
+      [ Tappable (hInviteFriends h gid) $ padded t 16 $ row
+          [ middle (icon "ic_add")
+          , gap t 24
+          , grow (middle (label 16 (pText p) "Invite friends"))
+          ]
+      | groupPhase g == InGroup ]
       -- Conferences only have a title.
       ++
-      [ (if editable then Tappable (hEditTopic h gid) else id) $ padded t 16 $ row $
-          grow (middle (column
-              [ label 16 (pText p) "Topic"
-              , label 13 (pMuted p) (if Text.null (groupTopic g) then "None" else groupTopic g)
-              ]))
-          : [ middle (icon "ic_edit") | editable ]
-      | groupKind g == NgcGroup ]
+      [ Tappable (hEditTopic h gid) $ padded t 16 $ row
+          [ middle (icon "ic_edit")
+          , gap t 24
+          , grow (middle (label 16 (pText p) "Change topic"))
+          ]
+      | groupKind g == NgcGroup, editable ]
       ++ [ padded t 16 (label 14 (pMuted p) audioNote) | groupKind g == AudioConference ]
       ++
       [ padded t 16 $ row
@@ -817,12 +984,14 @@ groupDetails env h model gid@(GroupId chatKey) g = column
           ]
       ]
       ++ concat
-      [ padded t 16 (label 14 (pAccent p) (memberCount (length members + 1)))
+      [ divider t
+        : padded t 16 (label 14 (pAccent p) (memberCount (length members + 1)))
         : person (ownKey model) "You" (groupSelfRole g) Nothing
         : [ Tappable (hMember h gid n)
               (person (memberKey m) (memberLabel m) (Map.lookup n (groupRoles g)) (Map.lookup n (groupStatuses g)))
           | (n, m) <- members ]
       | groupPhase g == InGroup ]
+      ++ [divider t]
       ++ relaying
       ++
       [ Tappable (hGroupSettings h gid) $ padded t 16 $ row
@@ -831,13 +1000,6 @@ groupDetails env h model gid@(GroupId chatKey) g = column
           , grow (middle (label 16 (pText p) "Group settings"))
           ]
       | groupPhase g == InGroup, groupSelfRole g == Just Tox.Founder, groupKind g == NgcGroup ]
-      ++
-      [ Tappable (hInviteFriends h gid) $ padded t 16 $ row
-          [ middle (icon "ic_add")
-          , gap t 24
-          , grow (middle (label 16 (pText p) "Invite friends"))
-          ]
-      | groupPhase g == InGroup ]
       ++
       [ Tappable (hLeaveGroup h gid) $ padded t 16 $ row
           [ middle (icon "ic_exit_to_app")
@@ -898,9 +1060,11 @@ groupSettingsScreen env h model gid g = column
   , grow $ scrollColumn $ case groupSettings g of
       Nothing -> [padded t 16 (label 14 (pMuted p) "Tox doesn't have the group's settings yet")]
       Just current ->
-        [ check (hPrivacy h gid) (Tox.groupPrivate current) "Private"
-            (if Tox.groupPrivate current then "Friends join when invited" else "Anyone with its chat ID can join")
-        , check (hTopicLock h gid) (Tox.groupTopicLock current) "Topic locked" "Only moderators may change the topic"
+        [ switchRow env (hPrivacy h gid) Nothing "Private"
+            (Just (if Tox.groupPrivate current then "Friends join when invited" else "Anyone with its chat ID can join"))
+            (Tox.groupPrivate current)
+        , switchRow env (hTopicLock h gid) Nothing "Topic locked" (Just "Only moderators may change the topic")
+            (Tox.groupTopicLock current)
         , Tappable (hVoice h gid) $ padded t 16 $ column
             [label 16 (pText p) "Who may speak", label 13 (pMuted p) (voiceName (Tox.groupVoice current))]
         , padded t 16 $ column $
@@ -918,11 +1082,6 @@ groupSettingsScreen env h model gid g = column
   where
     t = envTheme env
     p = thPalette t
-    check action on title about = Tappable action $ padded t 16 $ row
-      [ middle (icon (if on then "ic_check_box" else "ic_check_box_outline_blank"))
-      , gap t 24
-      , grow $ middle $ column [label 16 (pText p) title, label 13 (pMuted p) about]
-      ]
 
 voiceName :: Tox.Voice -> Text
 voiceName = \case
@@ -1103,7 +1262,7 @@ callScreen env h c phone contact notice = styled (\s -> s { wsBackgroundColor = 
       -- Name and timer over their video.
       : [ styled (\s -> s { wsAlignSelf = Just SelfStretch }) $ column
             [ middle $ styled
-                (\s -> s { wsBackgroundColor = Just (pScrim p), wsCornerRadius = Just (dp t 20)
+                (\s -> s { wsBackgroundColor = Just (pScrim p), wsCorners = Just (rounded (dp t 20))
                          , wsPadding = Just (dp t 12), wsMargin = Just (dp t 16) }) $ column
                 [ middle (label 20 white (contactLabel (callContact c) contact))
                 , middle (label 14 white status)
@@ -1112,9 +1271,9 @@ callScreen env h c phone contact notice = styled (\s -> s { wsBackgroundColor = 
             ]
         | peerVideo ]
       ++ [ styled (\s -> s { wsWidth = Just (dp t 108), wsHeight = Just (dp t 144), wsMargin = Just (dp t 16)
-                          , wsAlignSelf = Just SelfEnd, wsCornerRadius = Just (dp t 12) })
+                          , wsAlignSelf = Just SelfEnd, wsCorners = Just (rounded (dp t 12)) })
              (video selfStream ScaleFill)
-        | talking && callCamera c ]
+        | talking && callCamera c && not relayed ]
       ++ [ styled (\s -> s { wsAlignSelf = Just SelfStart, wsMargin = Just (dp t 8) })
              (iconButton t (hHideCall h) "ic_keyboard_arrow_down")
         | callPhase c /= Ringing ]
@@ -1124,18 +1283,23 @@ callScreen env h c phone contact notice = styled (\s -> s { wsBackgroundColor = 
     talking = case callPhase c of
       Talking _ -> True
       _         -> False
-    peerVideo = talking && callPeerVideo c
+    -- A linked device took it: we only pass it on.
+    relayed = isJust (callDevice c)
+    peerVideo = talking && callPeerVideo c && not relayed
     white = Color 0xff 0xff 0xff 0xff
     video stream scale = Image ImageConfig { icSource = ImageStream stream, icScaleType = scale }
     t = envTheme env
     p = thPalette t
     ContactId key = callContact c
     status = case callPhase c of
+      _ | relayed, Talking since <- callPhase c -> "On a linked device \x00B7 " <> duration (round (diffUTCTime (envNow env) since))
+        | relayed -> "Calling from a linked device\x2026"
       Calling -> "Calling\x2026"
       Ringing | callPeerVideo c -> "Incoming video call"
               | otherwise -> "Incoming voice call"
       Talking since -> duration (round (diffUTCTime (envNow env) since))
     buttons = case callPhase c of
+      _ | relayed -> [roundButton t (pError p) (hHangUp h) "ic_call_end"]
       Ringing ->
         [ roundButton t (pError p) (hHangUp h) "ic_call_end"
         , roundButton t (pOnline p) (hAnswer h False) "ic_call"
@@ -1184,6 +1348,15 @@ fileStatus mine file = byteSize (attachmentSize file) <> " \x00B7 " <> case atta
   Cancelled -> if mine then "Not sent" else "Not received"
   where
     percent done total = if total == 0 then 100 else done * 100 `div` total
+
+-- | Ours is 'Moving' while we hash it, and a paused download waits for us,
+-- not for a friend to come back.
+groupFileStatus :: Bool -> GroupFile -> Attachment -> Text
+groupFileStatus mine file a = case attachmentState a of
+  Moving | mine -> byteSize (attachmentSize a) <> " \x00B7 Preparing"
+         | groupFileRate file > 0 -> fileStatus mine a <> " \x00B7 " <> byteSize (floor (groupFileRate file)) <> "/s"
+  Interrupted -> byteSize (attachmentSize a) <> " \x00B7 Paused"
+  _ -> fileStatus mine a
 
 -- | In the largest unit that keeps it at least 1.
 byteSize :: Word64 -> Text
@@ -1234,7 +1407,12 @@ profile env h model = column
       , gap t 16
       , middle (pill t (pTheirs p) (hExport h) "Export profile (.tox)")
       , middle (label 12 (pMuted p) "The file holds your secret key: keep it safe.")
-      , gap t 16
+      ]
+      ++ concat
+      [ [gap t 16, middle (pill t (pTheirs p) (hOpenDevices h) "Linked devices")]
+      | isNothing (clientLinked client) ]
+      ++
+      [ gap t 16
       , middle (label 12 (pMuted p) ("hTox " <> version))
       ]
   ]
@@ -1270,12 +1448,14 @@ backup env h model = column
           [label 16 (pText p) (accountName a), labelIn monospace 13 (pMuted p) (Text.take 8 (accountKey a))]
       ]
 
--- | Where time and memory go: the runtime, the busiest work, threads, and
--- what hTox and Tox hold.
+-- | Where time and memory go: the runtime, the busiest work, threads, what
+-- hTox and Tox hold, and how calls go.
 debugScreen :: Env -> Handlers -> Model -> Widget
 debugScreen env h model = column
   [ appBar t [iconButton t (hBack h) "ic_arrow_back", grow (label 22 (pText p) "Debug")]
-  , grow $ scrollColumn $ export : case modelDebug model of
+  , grow $ scrollColumn $ export : line ("Database version " <> Text.pack (show (envSchema env)))
+      : [line ("Graphics: " <> envGraphics env) | not (Text.null (envGraphics env))]
+      ++ [line ("Tox library: " <> toxcoreName (envToxcore env))] ++ case modelDebug model of
       Nothing -> [line "Measuring\x2026"]
       Just r -> concat
         [ heading "Memory" : maybe [line "The runtime keeps no statistics without -T."] memory (Debug.reportRuntime r)
@@ -1284,6 +1464,7 @@ debugScreen env h model = column
         , heading "hTox holds" : held
         , heading "Tox holds" : map size (filter ((> 0) . Tox.sizeCount) (Debug.reportSizes r))
         , heading "Traffic since Tox started" : map traffic (sortOn (negate . Tox.countBytes . snd) (Debug.reportTraffic r))
+        , [ heading "Calls" | not (null (Debug.reportCalls r)) ] ++ map (line . Debug.callText) (Debug.reportCalls r)
         ]
   ]
   where
@@ -1373,6 +1554,66 @@ linking env h model = column
     t = envTheme env
     p = thPalette t
 
+-- | Other devices of the account sync through this one: it runs the account
+-- on Tox, and they show its chats.
+devicesScreen :: Env -> Handlers -> Model -> Widget
+devicesScreen env h model = column
+  [ appBar t [iconButton t (hBack h) "ic_arrow_back", grow (label 22 (pText p) "Linked devices")]
+  , grow $ scrollColumn $
+      [ padded t 16 $ label 14 (pText p)
+          "Other devices can show this profile's chats, send for it and take its calls. This device stays \
+          \the one on Tox: they sync and call through it while it's online."
+      ]
+      ++ (case pairing of
+            Just link ->
+              [ padded t 16 $ column
+                  [ label 14 (pText p) "On the other device, link to an account on another device with this link, within 10 minutes. It works once."
+                  , gap t 8
+                  , row [ grow (middle (labelIn monospace 13 (pMuted p) link))
+                        , middle (iconButton t (hCopyPairing h) "ic_content_copy") ]
+                  , gap t 16
+                  , middle $ styled (\s -> s { wsWidth = Just (dp t 200), wsHeight = Just (dp t 200) }) $
+                      Image ImageConfig { icSource = ImageData (envQr env), icScaleType = ScaleFit }
+                  ] ]
+            Nothing ->
+              [ styled (\s -> s { wsAlignSelf = Just SelfCenter, wsMargin = Just (dp t 12) }) $
+                  pill t (pMine p) (hPairDevice h) "Link a device" ])
+      ++ map device devices
+  ]
+  where
+    t = envTheme env
+    p = thPalette t
+    home = clientHome (modelClient model)
+    pairing = pairingLink model
+    devices = maybe [] (Map.toList . Home.devices) home
+    device (Sync.PublicKey pk, name) = padded t 16 $ row
+      [ middle (icon "ic_link")
+      , gap t 24
+      , grow $ middle $ column
+          [ label 16 (pText p) (if Text.null name then "Device" else name)
+          , labelIn monospace 13 (pMuted p) (Text.take 8 (hexKey pk)) ]
+      , middle (iconButton t (hRemoveDevice h (ContactId (hexKey pk))) "ic_delete")
+      ]
+    hexKey = Text.toUpper . Text.decodeUtf8 . Base16.encode
+
+-- | Another client saved the profile with a password.
+unlocking :: Env -> Handlers -> Model -> Widget
+unlocking env h model = column
+  [ appBar t [iconButton t (hBack h) "ic_arrow_back", grow (label 22 (pText p) "Import a profile")]
+  , padded t 16 $ column $
+      [ label 14 (pText p) "This profile was saved with a password. hTox keeps it in its own encrypted storage, without the password."
+      , gap t 16
+      , label 12 (pAccent p) "Password"
+      , input InputPassword (hPassword h) "" (modelPassword model)
+      ]
+      ++ [label 12 (pError p) err | Just err <- [modelNotice model]]
+  , styled (\s -> s { wsAlignSelf = Just SelfEnd, wsPadding = Just (dp t 16) }) $
+      row [pill t (pMine p) (hUnlock h) "Import"]
+  ]
+  where
+    t = envTheme env
+    p = thPalette t
+
 -- | Proxy for TCP relays.
 proxy :: Env -> Handlers -> Model -> Widget
 proxy env h model = column
@@ -1402,31 +1643,34 @@ proxyName pr = named (Tox.proxyType pr) <> Text.pack (Tox.proxyHost pr) <> ":" <
       Tox.Socks5Proxy  -> "SOCKS5 "
       Tox.GatewayProxy -> "Gateway "
 
+toxcoreName :: Toxcore -> Text
+toxcoreName = \case
+  HsToxcore -> "hs-toxcore"
+  CToxcore  -> "c-toxcore"
+
 -- | Account and device settings.
 settings :: Env -> Handlers -> Model -> Widget
 settings env h model = column
   [ appBar t [iconButton t (hBack h) "ic_arrow_back", grow (label 22 (pText p) "Settings")]
   , grow $ scrollColumn $
-      [ heading "Files"
-      , choice (hAutoAccept h) "Accept files without asking" $
+      [ heading "Your account"
+      , choice (hAutoAccept h) "Auto-accept files" $
           case settingAutoAccept (clientAccount client) of
             0    -> "Never"
             size -> "Up to " <> byteSize size
-      , heading "Messages"
-      ]
-      ++ [ choice (hToggleFormat h (Formats.formatKey f)) (Formats.formatName f)
-             (onOff (Formats.formatKey f `Set.notMember` settingFormatsOff (clientAccount client)) <> ". " <> Formats.formatAbout f)
-         | f <- Formats.formats ]
-      ++
-      [ heading "On this device"
-      , choice (hToggleStay h) "Stay online"
-          (if settingStay device then "While hTox is closed, and once the phone starts" else "Only while hTox is open or in a call")
-      , choice (hToggleUdp h) "Connect directly (UDP)" (onOff (settingUdp device))
-      , choice (hToggleIpv6 h) "Use IPv6" (onOff (settingIpv6 device))
-      , choice (hToggleLan h) "Find friends on the local network" (onOff (settingLan device))
+      , toggle (hToggleTyping h) "Typing indicators" (Just "You see when friends are writing, and they see when you are")
+          (settingTyping (clientAccount client))
+      , heading "On this device"
+      , toggle (hToggleStay h) "Stay online" (Just "While hTox is closed, and once the phone starts") (settingStay device)
+      , toggle (hToggleUdp h) "Connect directly (UDP)" Nothing (settingUdp device)
+      , toggle (hToggleIpv6 h) "Use IPv6" Nothing (settingIpv6 device)
+      , toggle (hToggleLan h) "Find friends on the local network" Nothing (settingLan device)
       , choice (hOpenProxy h) "Proxy" (maybe "None" proxyName (settingProxy device))
-      , padded t 16 $ label 13 (pMuted p) "Network changes apply when hTox starts again."
       ]
+      ++ [ choice (hChooseToxcore h) "Tox library" (toxcoreName (settingToxcore device)) | length (envToxcores env) > 1 ]
+      ++ [ padded t 16 $ label 13 (pMuted p) $
+             if isJust (clientCall client) then "During a call, network changes apply when hTox starts again."
+             else "Network changes apply as you leave the settings." ]
   ]
   where
     client = modelClient model
@@ -1436,7 +1680,7 @@ settings env h model = column
     heading name = padded t 16 $ label 14 (pAccent p) name
     choice action name value = Tappable action $ padded t 16 $ column
       [label 16 (pText p) name, label 14 (pMuted p) value]
-    onOff on = if on then "On" else "Off"
+    toggle action = switchRow env action Nothing
 
 -- | Who to forward to, latest chat first.
 forward :: Env -> Handlers -> Model -> Widget
@@ -1454,19 +1698,26 @@ forward env h model = column
     t = envTheme env
     p = thPalette t
 
--- | When it was sent and delivered, and who sent it.
-messageInfo :: Env -> Handlers -> ContactId -> Contact -> Message -> Widget
-messageInfo env h cid@(ContactId key) contact m = column
+-- | A message and what we know of it.
+infoScreen :: Env -> Handlers -> Text -> [(Text, Text)] -> Widget
+infoScreen env h said facts = column
   [ appBar t [iconButton t (hBack h) "ic_arrow_back", grow (label 22 (pText p) "Message")]
-  , grow $ scrollColumn $
-      padded t 16 (label 16 (pText p) (preview (contactLabel cid contact) m))
-      : concatMap (uncurry fact) facts
+  , grow $ scrollColumn $ padded t 16 (label 16 (pText p) said) : map fact facts
   ]
   where
     t = envTheme env
     p = thPalette t
-    when' time = localTime env "%b %-d, %Y " time <> localTime env (clockFormat env) time
-    fact name value = [padded t 16 $ column [label 16 (pText p) name, label 14 (pMuted p) value]]
+    fact (name, value) = padded t 16 $ column [label 16 (pText p) name, label 14 (pMuted p) value]
+
+-- | Date and time in full.
+fullTime :: Env -> UTCTime -> Text
+fullTime env time = localTime env "%b %-d, %Y " time <> localTime env (clockFormat env) time
+
+-- | When it was sent and delivered, and who sent it.
+messageInfo :: Env -> Handlers -> ContactId -> Contact -> Message -> Widget
+messageInfo env h cid@(ContactId key) contact m = infoScreen env h (preview (contactHideAfterZero contact) (contactLabel cid contact) m) facts
+  where
+    when' = fullTime env
     facts
       | messageMine m =
           (if messageDelivery m == Pending then "Sending" else "Sent", when' (messageTime m))
@@ -1474,6 +1725,20 @@ messageInfo env h cid@(ContactId key) contact m = column
       | otherwise =
           [ ("Received", when' (messageTime m))
           , ("From", contactLabel cid contact <> "\n" <> key) ]
+          -- What the chat doesn't show, as Tox carried it.
+
+-- | When it was sent or came, and who sent it (relayed ones by the name
+-- relayed). Groups confirm no delivery.
+groupMessageInfo :: Env -> Handlers -> Model -> Group -> GroupEntry -> Widget
+groupMessageInfo env h model g e = infoScreen env h (fromMaybe "" (entryText e)) $ case entryWhat e of
+  Said Nothing _ _ delivery _ -> [sending delivery]
+  Said (Just m) _ body _ _    -> [received, ("From", fst (uttered (clientProfile (modelClient model)) g m (shownText False body)) <> "\n" <> memberKey m)]
+  PrivateFrom m _ _           -> [received, ("Privately from", memberLabel m <> "\n" <> memberKey m)]
+  PrivateTo m _ _ delivery    -> [sending delivery, ("Privately to", memberLabel m <> "\n" <> memberKey m)]
+  _                           -> []
+  where
+    sending delivery = (if delivery == Pending then "Sending" else "Sent", fullTime env (entryTime e))
+    received = ("Received", fullTime env (entryTime e))
 
 details :: Env -> Handlers -> ContactId -> Contact -> Widget
 details env h cid@(ContactId key) contact = column
@@ -1506,6 +1771,8 @@ details env h cid@(ContactId key) contact = column
                   (pictureFormat =<< contactPictures contact)
               ]
           ]
+      , switchRow env (hHideAfterZero h cid) Nothing "Hide after a zero byte"
+          (Just "Shows \"\\0[12 bytes]\" in place of the rest of a message") (contactHideAfterZero contact)
       , padded t 16 $ row
           [ grow $ middle $ column
               [ label 16 (pText p) "Public key"
@@ -1513,6 +1780,7 @@ details env h cid@(ContactId key) contact = column
               ]
           , middle (iconButton t (hCopyKey h cid) "ic_content_copy")
           ]
+      , divider t
       , Tappable (hDelete h cid) $ padded t 16 $ row
           [ middle (icon "ic_delete")
           , gap t 24
@@ -1600,10 +1868,10 @@ ownKey = Text.take 64 . profileToxId . clientProfile . modelClient
 avatar :: Env -> Double -> Text -> Maybe Bool -> Widget
 avatar env size key online = stack $
   styled (\s -> s { wsWidth = Just (dp t size), wsHeight = Just (dp t size)
-                  , wsCornerRadius = Just (dp t size / 2) })
+                  , wsCorners = Just (rounded (dp t size / 2)) })
     (Image ImageConfig { icSource = ImageData (envAvatar env key), icScaleType = ScaleFill })
   : [ styled (\s -> s { wsWidth = Just (dp t 14), wsHeight = Just (dp t 14)
-                    , wsCornerRadius = Just (dp t 7), wsAlignSelf = Just SelfEnd
+                    , wsCorners = Just (rounded (dp t 7)), wsAlignSelf = Just SelfEnd
                     , wsBackgroundColor = Just (pOnline (thPalette t)) })
       (text "")
   | online == Just True ]
@@ -1615,13 +1883,13 @@ appBar t = styled (\s -> s { wsHeight = Just (dp t 64), wsPadding = Just (dp t 4
 
 roundButton :: Theme -> Color -> Action -> Text -> Widget
 roundButton t colour action name = Tappable action $ styled
-  (\s -> s { wsBackgroundColor = Just colour, wsPadding = Just (dp t 18), wsCornerRadius = Just (dp t 30)
+  (\s -> s { wsBackgroundColor = Just colour, wsPadding = Just (dp t 18), wsCorners = Just (rounded (dp t 30))
            , wsWidth = Just (dp t 60), wsHeight = Just (dp t 60) })
   (icon name)
 
 iconButton :: Theme -> Action -> Text -> Widget
 iconButton t action name = Tappable action $ styled
-  (\s -> s { wsPadding = Just (dp t 12), wsCornerRadius = Just (dp t 24) })
+  (\s -> s { wsPadding = Just (dp t 12), wsCorners = Just (rounded (dp t 24)) })
   (icon name)
 
 icon :: Text -> Widget
@@ -1630,7 +1898,7 @@ icon name = Image ImageConfig
 
 pill :: Theme -> Color -> Action -> Text -> Widget
 pill t colour action caption = styled
-  (\s -> s { wsBackgroundColor = Just colour, wsCornerRadius = Just (dp t 24) })
+  (\s -> s { wsBackgroundColor = Just colour, wsCorners = Just (rounded (dp t 24)) })
   (button caption action)
 
 divider :: Theme -> Widget
@@ -1651,8 +1919,10 @@ labelIn font size colour txt = Text TextConfig
   , tcTextColor = Just colour
   }
 
-bold, monospace :: FontConfig -> FontConfig
+-- | Italic sets apart what nobody wrote, such as who joined.
+bold, italic, monospace :: FontConfig -> FontConfig
 bold f = f { fontWeight = FontBold }
+italic f = f { fontSlant = FontItalic }
 monospace f = f { fontFamily = FontMonospace }
 
 input :: InputType -> OnChange -> Text -> Text -> Widget
