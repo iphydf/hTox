@@ -1,3 +1,4 @@
+{-# LANGUAGE StrictData #-}
 -- The numbers live in a table, which GHC mustn't share or float out.
 {-# OPTIONS_GHC -fno-cse -fno-full-laziness #-}
 -- | Names for what each tap and edit in a view does. The view only knows them
@@ -8,11 +9,11 @@ module HTox.Taps
   , tapped
   ) where
 
+import qualified Data.ByteString     as BS
 import           Data.Int            (Int32)
 import           Data.IORef          (IORef, atomicModifyIORef', newIORef,
                                       readIORef)
 import           Data.List           (find)
-import           Data.Text           (Text)
 import           Hatter.Action       (Action (..), OnChange (..), OnScroll (..))
 import           HTox.Model          (ContactId, Founding, GroupId, MessageId,
                                       ProfileId)
@@ -38,7 +39,12 @@ data Tapped
   | Attach
   | TapMessage ContactId MessageId
   | HoldMessage ContactId MessageId
+  | TapEntry GroupId MessageId
+  | HoldEntry GroupId MessageId
   | CancelFile ContactId MessageId
+  | SendAgain ContactId MessageId
+  | GroupFileDownload GroupId BS.ByteString
+  | GroupFilePause GroupId BS.ByteString
   | Unselect
   | CopySelected
   | ForwardSelected
@@ -64,8 +70,9 @@ data Tapped
   | ToggleIpv6
   | ToggleLan
   | ToggleStay
-  | ToggleFormat Text
+  | ToggleTyping
   | OpenProxy
+  | ChooseToxcore
   | ProxyKind (Maybe Tox.ProxyType)
   | ProxyHost
   | ProxyPort
@@ -77,6 +84,7 @@ data Tapped
   | Details ContactId
   | MuteChat ContactId
   | Delete ContactId
+  | HoldChat ContactId
   | CopyKey ContactId
   | Pictures ContactId
   | Draft
@@ -99,8 +107,10 @@ data Tapped
   | OpenGroup GroupId
   | GroupDetails GroupId
   | MuteGroup GroupId
+  | GroupPictures GroupId
   | LeaveGroup GroupId
   | DeleteGroup GroupId
+  | HoldGroup GroupId
   | CopyChatId GroupId
   | OpenInvite ContactId GroupId
   | Join ContactId GroupId
@@ -131,6 +141,11 @@ data Tapped
   | OpenLink
   | LinkEdited
   | Link
+  | Unlock
+  | OpenDevices
+  | PairDevice
+  | CopyPairing
+  | RemoveDevice ContactId
   deriving (Eq, Show)
 
 handlers :: Handlers
@@ -151,7 +166,10 @@ handlers = Handlers
   , hAttach = act Attach
   , hTapMessage = \a b -> act (TapMessage a b)
   , hHoldMessage = \a b -> act (HoldMessage a b)
+  , hTapEntry = \a b -> act (TapEntry a b)
+  , hHoldEntry = \a b -> act (HoldEntry a b)
   , hCancelFile = \a b -> act (CancelFile a b)
+  , hSendAgain = \a b -> act (SendAgain a b)
   , hUnselect = act Unselect
   , hCopySelected = act CopySelected
   , hForwardSelected = act ForwardSelected
@@ -177,8 +195,9 @@ handlers = Handlers
   , hToggleIpv6 = act ToggleIpv6
   , hToggleLan = act ToggleLan
   , hToggleStay = act ToggleStay
-  , hToggleFormat = act . ToggleFormat
+  , hToggleTyping = act ToggleTyping
   , hOpenProxy = act OpenProxy
+  , hChooseToxcore = act ChooseToxcore
   , hProxyKind = act . ProxyKind
   , hProxyHost = change ProxyHost
   , hProxyPort = change ProxyPort
@@ -190,6 +209,7 @@ handlers = Handlers
   , hDetails = act . Details
   , hMuteChat = act . MuteChat
   , hDelete = act . Delete
+  , hHoldChat = act . HoldChat
   , hCopyKey = act . CopyKey
   , hPictures = act . Pictures
   , hDraft = change Draft
@@ -212,8 +232,10 @@ handlers = Handlers
   , hOpenGroup = act . OpenGroup
   , hGroupDetails = act . GroupDetails
   , hMuteGroup = act . MuteGroup
+  , hGroupPictures = act . GroupPictures
   , hLeaveGroup = act . LeaveGroup
   , hDeleteGroup = act . DeleteGroup
+  , hHoldGroup = act . HoldGroup
   , hCopyChatId = act . CopyChatId
   , hOpenInvite = \a b -> act (OpenInvite a b)
   , hJoin = \a b -> act (Join a b)
@@ -231,6 +253,8 @@ handlers = Handlers
   , hInviteFriends = act . InviteFriends
   , hInviteFriend = \a b -> act (InviteFriend a b)
   , hMember = \a b -> act (Member a b)
+  , hGroupFile = \a b -> act (GroupFileDownload a b)
+  , hPauseGroupFile = \a b -> act (GroupFilePause a b)
   , hEndPrivate = act EndPrivate
   , hGroupSettings = act . GroupSettings
   , hPrivacy = act . Privacy
@@ -244,6 +268,11 @@ handlers = Handlers
   , hOpenLink = act OpenLink
   , hLinkEdited = change LinkEdited
   , hLink = act Link
+  , hUnlock = act Unlock
+  , hOpenDevices = act OpenDevices
+  , hPairDevice = act PairDevice
+  , hCopyPairing = act CopyPairing
+  , hRemoveDevice = act . RemoveDevice
   }
 
 -- | Names with their numbers, newest first.

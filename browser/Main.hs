@@ -2,9 +2,10 @@
 -- gateway.
 module Main (main) where
 
-import           Hatter.Browser (runBrowser)
+import           Hatter.Browser     (runBrowser)
+import           Tox.Client.Toxcore (hsToxcore)
 
-import           HTox.App       (app)
+import           HTox.App           (app)
 
 foreign export javascript "start" start :: IO ()
 
@@ -13,7 +14,7 @@ foreign import javascript unsafe "if (globalThis.toxGateway === undefined) globa
   js_defaultGateway :: IO ()
 
 start :: IO ()
-start = js_defaultGateway >> runBrowser app
+start = js_defaultGateway >> runBrowser (app [hsToxcore])
 
 -- | The page starts it with 'start'.
 main :: IO ()

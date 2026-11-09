@@ -1,4 +1,4 @@
-# App's shared library for Android.
+# The app's shared library for Android.
 { androidArch ? "aarch64" }:
 let
   hatter = import ./hatter.nix;
@@ -46,9 +46,13 @@ let
     withStatic = true;
     withShared = false;
   }).overrideAttrs (old: {
-    # MediaCodec needs ffmpeg to know it's on Android, not plain Linux.
+    # nixpkgs says Linux.
     configureFlags = map (f: if f == "--target_os=linux" then "--target_os=android" else f) old.configureFlags
-      ++ [ "--enable-pic" "--enable-jni" "--enable-mediacodec" ];
+      ++ [ "--enable-pic" ];
+  });
+  # hs-tox's C backend, static like the others.
+  c-toxcore = (androidPkgs.callPackage ./c-toxcore.nix { inherit libsodium libopus libvpx; }).overrideAttrs (old: {
+    cmakeFlags = old.cmakeFlags ++ [ "-DENABLE_SHARED=OFF" ];
   });
   # For SQLCipher. We only use libcrypto, and kernel TLS doesn't build for
   # Android.
@@ -70,10 +74,13 @@ let
           self.toxsync.drvPath
           self.tox.drvPath
           self.toxav.drvPath
+          self.toxcore-c.drvPath
+          self.tox-c.drvPath
         ]));
       in {
         saltine = super.saltine.override { inherit libsodium; };
         direct-sqlite = import ./sqlcipher.nix { pkgs = hatter.pkgs; inherit openssl; } super.direct-sqlite;
+        toxcore-c = super.toxcore-c.override { toxcore = c-toxcore; };
         toxav = super.toxav.override {
           libavcodec = ffmpeg;
           inherit ffmpeg;
@@ -88,11 +95,11 @@ let
           })));
       });
     # Only Main.hs is built outside the package.
-    consumerCabal2Nix = { mkDerivation, base, lib, htox }:
+    consumerCabal2Nix = { mkDerivation, base, lib, htox, tox, tox-c }:
       mkDerivation {
         pname = "htox-main";
         version = "0.1.0";
-        libraryHaskellDepends = [ base htox ];
+        libraryHaskellDepends = [ base htox tox tox-c ];
         license = lib.licenses.gpl3Only;
       };
   };
@@ -110,6 +117,7 @@ lib.mkAndroidLib {
   # by type (only when asked: the interval is over a day).
   rtsOpts = "-T -hT -i100000 -po/data/data/chat.tox.hstox/files/heap";
   extraLinkObjects = [
+    "${c-toxcore}/lib/libtoxcore.a"
     "${libsodium}/lib/libsodium.a"
     "${openssl.out}/lib/libcrypto.a"
     "${ffmpeg.lib or ffmpeg}/lib/libavcodec.a"
@@ -117,7 +125,6 @@ lib.mkAndroidLib {
     "${libvpx}/lib/libvpx.a"
     "${libopus}/lib/libopus.a"
     "-lmediandk"
-    "-landroid"
   ];
   # Hatter's sources are in the build directory, but we use it from the
   # package database.

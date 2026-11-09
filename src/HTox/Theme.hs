@@ -1,3 +1,4 @@
+{-# LANGUAGE StrictData #-}
 -- | Sizes and colours from Material's theme. Text uses the platform
 -- theme's colours unless it needs its own.
 module HTox.Theme

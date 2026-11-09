@@ -21,3 +21,5 @@ executable htox
     , hatter-terminal
     , text
     , htox
+    , tox
+    , tox-c

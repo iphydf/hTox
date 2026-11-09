@@ -19,6 +19,8 @@ library
     HTox.Emoji
     HTox.Links
     HTox.Model
+    HTox.Playback
+    HTox.Private
     HTox.Store
     HTox.Theme
     HTox.Version
@@ -33,6 +35,7 @@ library
     , hatter
     , saltine
     , sqlite-simple
+    , stm
     , text
     , time
     , tox
@@ -40,6 +43,8 @@ library
     , toxcore
     , toxsync
     , vector
+  if !os(windows)
+    build-depends: unix
 
 test-suite testsuite
   default-language:   Haskell2010
@@ -52,20 +57,27 @@ test-suite testsuite
     HTox.LinksSpec
     HTox.Taps
     HTox.ModelSpec
+    HTox.PlaybackSpec
     HTox.Sample
     HTox.StoreSpec
     HTox.ViewSpec
   build-depends:
       base               <5
+    , base16-bytestring
     , bytestring
     , containers
     , directory
     , filepath
     , hatter
     , hspec
+    , saltine
     , sqlite-simple
     , text
     , time
     , tox
+    , toxav
     , toxcore
+    , toxsync
+    , unix
+    , vector
     , htox
